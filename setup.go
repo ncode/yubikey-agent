@@ -65,6 +65,56 @@ func runReset(yk *piv.YubiKey) {
 	}
 }
 
+func generateAndStoreSshKey(yk *piv.YubiKey, key [24]byte, slot piv.Slot, policy piv.PINPolicy, touch piv.TouchPolicy) (ssh.PublicKey, error) {
+	pub, err := yk.GenerateKey(key, slot, piv.Key{
+		Algorithm:   piv.AlgorithmEC256,
+		PINPolicy:   policy,
+		TouchPolicy: touch,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("Failed to generate key for slot %x: %s", slot, err.Error())
+	}
+
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to generate parent key for slot %x: %s", slot, err.Error())
+	}
+	parent := &x509.Certificate{
+		Subject: pkix.Name{
+			Organization:       []string{"yubikey-agent"},
+			OrganizationalUnit: []string{Version},
+		},
+		PublicKey: priv.Public(),
+	}
+	template := &x509.Certificate{
+		Subject: pkix.Name{
+			CommonName: "SSH key",
+		},
+		NotAfter:     time.Now().AddDate(42, 0, 0),
+		NotBefore:    time.Now(),
+		SerialNumber: randomSerialNumber(),
+		KeyUsage:     x509.KeyUsageKeyAgreement | x509.KeyUsageDigitalSignature,
+	}
+	certBytes, err := x509.CreateCertificate(rand.Reader, template, parent, pub, priv)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to generate certificate for slot %x: %s", slot, err.Error())
+	}
+	cert, err := x509.ParseCertificate(certBytes)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to parse certificate for slot %x: %s", slot, err.Error())
+	}
+	if err := yk.SetCertificate(key, slot, cert); err != nil {
+		return nil, fmt.Errorf("Failed to store certificate on slot %x: %s", slot, err.Error())
+	}
+
+	sshKey, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		return nil, fmt.Errorf("Failed to generate public key for slot %x: %s", slot, err.Error())
+	}
+
+	return sshKey, nil
+}
+
 func runSetup(yk *piv.YubiKey) {
 	if _, err := yk.Certificate(piv.SlotAuthentication); err == nil {
 		log.Println("‼️  This YubiKey looks already setup")
@@ -136,58 +186,25 @@ func runSetup(yk *piv.YubiKey) {
 		log.Fatalln("use --really-delete-all-piv-keys ⚠️")
 	}
 
-	pub, err := yk.GenerateKey(key, piv.SlotAuthentication, piv.Key{
-		Algorithm:   piv.AlgorithmEC256,
-		PINPolicy:   piv.PINPolicyOnce,
-		TouchPolicy: piv.TouchPolicyAlways,
-	})
+	sshKey9a, err := generateAndStoreSshKey(yk, key, piv.SlotAuthentication, piv.PINPolicyOnce, piv.TouchPolicyAlways)
 	if err != nil {
-		log.Fatalln("Failed to generate key:", err)
+		log.Fatal(err)
 	}
 
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	sshKey9e, err := generateAndStoreSshKey(yk, key, piv.SlotCardAuthentication, piv.PINPolicyOnce, piv.TouchPolicyNever)
 	if err != nil {
-		log.Fatalln("Failed to generate parent key:", err)
-	}
-	parent := &x509.Certificate{
-		Subject: pkix.Name{
-			Organization:       []string{"yubikey-agent"},
-			OrganizationalUnit: []string{Version},
-		},
-		PublicKey: priv.Public(),
-	}
-	template := &x509.Certificate{
-		Subject: pkix.Name{
-			CommonName: "SSH key",
-		},
-		NotAfter:     time.Now().AddDate(42, 0, 0),
-		NotBefore:    time.Now(),
-		SerialNumber: randomSerialNumber(),
-		KeyUsage:     x509.KeyUsageKeyAgreement | x509.KeyUsageDigitalSignature,
-	}
-	certBytes, err := x509.CreateCertificate(rand.Reader, template, parent, pub, priv)
-	if err != nil {
-		log.Fatalln("Failed to generate certificate:", err)
-	}
-	cert, err := x509.ParseCertificate(certBytes)
-	if err != nil {
-		log.Fatalln("Failed to parse certificate:", err)
-	}
-	if err := yk.SetCertificate(key, piv.SlotAuthentication, cert); err != nil {
-		log.Fatalln("Failed to store certificate:", err)
-	}
-
-	sshKey, err := ssh.NewPublicKey(pub)
-	if err != nil {
-		log.Fatalln("Failed to generate public key:", err)
+		log.Fatal(err)
 	}
 
 	fmt.Println("")
 	fmt.Println("✅ Done! This YubiKey is secured and ready to go.")
 	fmt.Println("🤏 When the YubiKey blinks, touch it to authorize the login.")
 	fmt.Println("")
-	fmt.Println("🔑 Here's your new shiny SSH public key:")
-	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey))
+	fmt.Println("🔑 Here's your new shiny SSH public key for slot 9a:")
+	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey9a))
+	fmt.Println("")
+	fmt.Println("🔑 Here's your new shiny SSH public key for slot 9e:")
+	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey9e))
 	fmt.Println("")
 	fmt.Println("Next steps: ensure yubikey-agent is running via launchd/systemd/...,")
 	fmt.Println(`set the SSH_AUTH_SOCK environment variable, and test with "ssh-add -L"`)
