@@ -42,31 +42,24 @@ var enabledSlots = []piv.Slot{
 	piv.SlotCardAuthentication,
 }
 
-// func findYubikeys()(yubikeys string[], err error) {
-// 	cards, err := piv.Cards()
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	if len(cards) == 0 {
-// 		return nil, errors.New("no smart card detected")
-// 	}
+// ListYubiKeys list all connected YubiKeys
+func ListYubiKeys() (yubikeys []string, err error) {
+	cards, err := piv.Cards()
+	if err != nil {
+		return nil, err
+	}
+	if len(cards) == 0 {
+		return nil, errors.New("no smart card detected")
+	}
 
-// 	for _, card := range cards {
-// 		if strings.HasPrefix(strings.ToLower(card), "yubico") {
-// 			// TODO: support multiple YubiKeys.
-// 			yk, err := piv.Open(card)
-// 			if err != nil {
-// 				return nil, err
-// 			}
-// 			// Cache the serial number locally because requesting it on older firmwares
-// 			// requires switching application, which drops the PIN cache.
-// 			a.serial, err = yk.Serial()
-// 			if err != nil {
-// 				return nil, err
-// 			}
-// 			return yk, nil
-// 		}
-// 	}
+	for _, card := range cards {
+		if strings.HasPrefix(strings.ToLower(card), "yubico") {
+			yubikeys = append(yubikeys, card)
+		}
+	}
+
+	return yubikeys, err
+}
 
 // 	return nil, errors.New("no YubiKey detected")
 // }
@@ -168,34 +161,21 @@ func (a *Agent) ensureYK() error {
 }
 
 func (a *Agent) connectToYK() (*piv.YubiKey, error) {
-	cards, err := piv.Cards()
+	cards, err := ListYubiKeys()
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	// TODO: support multiple YubiKeys.
+	yk, err := piv.Open(cards[0])
 	if err != nil {
 		return nil, err
 	}
-	if len(cards) == 0 {
-		return nil, errors.New("no smart card detected")
-	}
 
-	for _, card := range cards {
-		if strings.HasPrefix(strings.ToLower(card), "yubico") {
-			// TODO: support multiple YubiKeys.
-			yk, err := piv.Open(card)
-			if err != nil {
-				return nil, err
-			}
-			// Cache the serial number locally because requesting it on older firmwares
-			// requires switching application, which drops the PIN cache.
-			a.serial, err = yk.Serial()
-			if err != nil {
-				return nil, err
-			}
-			return yk, nil
-		}
-	}
-
-	return nil, errors.New("no YubiKey detected")
+	return yk, nil
 }
 
+// Close finish the connection to the YubiKey device and unlock it
 func (a *Agent) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()

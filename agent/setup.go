@@ -43,12 +43,9 @@ func init() {
 }
 
 func connectForSetup() *piv.YubiKey {
-	cards, err := piv.Cards()
+	cards, err := ListYubiKeys()
 	if err != nil {
-		log.Fatalln("Failed to enumerate tokens:", err)
-	}
-	if len(cards) == 0 {
-		log.Fatalln("No YubiKeys detected!")
+		log.Fatalln(err)
 	}
 	// TODO: support multiple YubiKeys.
 	yk, err := piv.Open(cards[0])
