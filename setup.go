@@ -149,6 +149,14 @@ func runSetup(yk *piv.YubiKey) {
 	fmt.Println("")
 	fmt.Println("🧪 Reticulating splines...")
 
+	fmt.Println("")
+	fmt.Println("Configuring slots following the definition from yubico-piv-tool")
+	fmt.Println("details https://developers.yubico.com/PIV/Introduction/Certificate_slots.html")
+	fmt.Println(" - 9a is for PIV Authentication (PIN Once)")
+	fmt.Println(" - 9c is for Digital Signature (PIN always checked)")
+	fmt.Println(" - 9d is for Key Management (PIN Once)")
+	fmt.Println(" - 9e is for Card Authentication (PIN never checked)")
+
 	var key [24]byte
 	if _, err := rand.Read(key[:]); err != nil {
 		log.Fatal(err)
@@ -191,7 +199,17 @@ func runSetup(yk *piv.YubiKey) {
 		log.Fatal(err)
 	}
 
-	sshKey9e, err := generateAndStoreSshKey(yk, key, piv.SlotCardAuthentication, piv.PINPolicyOnce, piv.TouchPolicyNever)
+	sshKey9c, err := generateAndStoreSshKey(yk, key, piv.SlotSignature, piv.PINPolicyAlways, piv.TouchPolicyAlways)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	sshKey9d, err := generateAndStoreSshKey(yk, key, piv.SlotCardAuthentication, piv.PINPolicyOnce, piv.TouchPolicyNever)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	sshKey9e, err := generateAndStoreSshKey(yk, key, piv.SlotKeyManagement, piv.PINPolicyNever, piv.TouchPolicyNever)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -203,8 +221,15 @@ func runSetup(yk *piv.YubiKey) {
 	fmt.Println("🔑 Here's your new shiny SSH public key for slot 9a:")
 	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey9a))
 	fmt.Println("")
+	fmt.Println("🔑 Here's your new shiny SSH public key for slot 9c:")
+	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey9c))
+	fmt.Println("")
+	fmt.Println("🔑 Here's your new shiny SSH public key for slot 9d:")
+	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey9d))
+	fmt.Println("")
 	fmt.Println("🔑 Here's your new shiny SSH public key for slot 9e:")
 	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey9e))
+
 	fmt.Println("")
 	fmt.Println("Next steps: ensure yubikey-agent is running via launchd/systemd/...,")
 	fmt.Println(`set the SSH_AUTH_SOCK environment variable, and test with "ssh-add -L"`)

@@ -37,6 +37,8 @@ import (
 
 var enabledSlots = []piv.Slot{
 	piv.SlotAuthentication,
+	piv.SlotSignature,
+	piv.SlotKeyManagement,
 	piv.SlotCardAuthentication,
 }
 
