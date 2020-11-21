@@ -176,17 +176,27 @@ func (a *Agent) connectToYK() (*piv.YubiKey, error) {
 		return nil, err
 	}
 	if len(cards) == 0 {
-		return nil, errors.New("no YubiKey detected")
+		return nil, errors.New("no smart card detected")
 	}
-	// TODO: support multiple YubiKeys.
-	yk, err := piv.Open(cards[0])
-	if err != nil {
-		return nil, err
+
+	for _, card := range cards {
+		if strings.HasPrefix(strings.ToLower(card), "yubico") {
+			// TODO: support multiple YubiKeys.
+			yk, err := piv.Open(card)
+			if err != nil {
+				return nil, err
+			}
+			// Cache the serial number locally because requesting it on older firmwares
+			// requires switching application, which drops the PIN cache.
+			a.serial, err = yk.Serial()
+			if err != nil {
+				return nil, err
+			}
+			return yk, nil
+		}
 	}
-	// Cache the serial number locally because requesting it on older firmwares
-	// requires switching application, which drops the PIN cache.
-	a.serial, _ = yk.Serial()
-	return yk, nil
+
+	return nil, errors.New("no YubiKey detected")
 }
 
 func (a *Agent) Close() error {
