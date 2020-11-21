@@ -1,36 +1,27 @@
 package cmd
 
 import (
-	"fmt"
+	"github.com/ncode/yubikey-agent/agent"
 
 	"github.com/spf13/cobra"
 )
 
+var reallyDeleteAllPivKeys bool
+
 // setupCmd represents the setup command
 var setupCmd = &cobra.Command{
 	Use:   "setup",
-	Short: "A brief description of your command",
-	Long: `A longer description that spans multiple lines and likely contains examples
-and usage of using your command. For example:
-
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
+	Short: "setup the specified YubiKey",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("setup called")
+		yk := agent.ConnectForSetup()
+		if reallyDeleteAllPivKeys {
+			agent.RunReset(yk)
+		}
+		agent.RunSetup(yk)
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(setupCmd)
-
-	// Here you will define your flags and configuration settings.
-
-	// Cobra supports Persistent Flags which will work for this command
-	// and all subcommands, e.g.:
-	// setupCmd.PersistentFlags().String("foo", "", "A help for foo")
-
-	// Cobra supports local flags which will only run when this command
-	// is called directly, e.g.:
-	// setupCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
+	setupCmd.PersistentFlags().BoolVar(&reallyDeleteAllPivKeys, "really-delete-all-piv-keys", false, "wipe all current keys on your device")
 }

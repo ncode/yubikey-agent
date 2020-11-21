@@ -42,7 +42,7 @@ func init() {
 	Version = "(unknown version)"
 }
 
-func connectForSetup() *piv.YubiKey {
+func ConnectForSetup() *piv.YubiKey {
 	cards, err := ListYubiKeys()
 	if err != nil {
 		log.Fatalln(err)
@@ -55,26 +55,27 @@ func connectForSetup() *piv.YubiKey {
 	return yk
 }
 
-func runReset(yk *piv.YubiKey) {
+func RunReset(yk *piv.YubiKey) {
 	fmt.Println("Resetting YubiKey PIV applet...")
 	if err := yk.Reset(); err != nil {
 		log.Fatalln("Failed to reset YubiKey:", err)
 	}
 }
 
-func generateAndStoreSshKey(yk *piv.YubiKey, key [24]byte, slot piv.Slot, policy piv.PINPolicy, touch piv.TouchPolicy) (ssh.PublicKey, error) {
+// generateAndStoreSSHKey generates the key and store on the given slot and apply the expected touch policy
+func generateAndStoreSSHKey(yk *piv.YubiKey, key [24]byte, slot piv.Slot, policy piv.PINPolicy, touch piv.TouchPolicy) error {
 	pub, err := yk.GenerateKey(key, slot, piv.Key{
 		Algorithm:   piv.AlgorithmEC256,
 		PINPolicy:   policy,
 		TouchPolicy: touch,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("Failed to generate key for slot %x: %s", slot, err.Error())
+		return fmt.Errorf("Failed to generate key for slot %x: %s", slot, err.Error())
 	}
 
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to generate parent key for slot %x: %s", slot, err.Error())
+		return fmt.Errorf("Failed to generate parent key for slot %x: %s", slot, err.Error())
 	}
 	parent := &x509.Certificate{
 		Subject: pkix.Name{
@@ -94,30 +95,35 @@ func generateAndStoreSshKey(yk *piv.YubiKey, key [24]byte, slot piv.Slot, policy
 	}
 	certBytes, err := x509.CreateCertificate(rand.Reader, template, parent, pub, priv)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to generate certificate for slot %x: %s", slot, err.Error())
+		return fmt.Errorf("Failed to generate certificate for slot %x: %s", slot, err.Error())
 	}
 	cert, err := x509.ParseCertificate(certBytes)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to parse certificate for slot %x: %s", slot, err.Error())
+		return fmt.Errorf("Failed to parse certificate for slot %x: %s", slot, err.Error())
 	}
 	if err := yk.SetCertificate(key, slot, cert); err != nil {
-		return nil, fmt.Errorf("Failed to store certificate on slot %x: %s", slot, err.Error())
+		return fmt.Errorf("Failed to store certificate on slot %x: %s", slot, err.Error())
 	}
 
 	sshKey, err := ssh.NewPublicKey(pub)
 	if err != nil {
-		return nil, fmt.Errorf("Failed to generate public key for slot %x: %s", slot, err.Error())
+		return fmt.Errorf("Failed to generate public key for slot %x: %s", slot, err.Error())
 	}
 
-	return sshKey, nil
+	fmt.Println("🔑 Here's your new shiny SSH public key for slot %x:", slot)
+	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey))
+	fmt.Println("")
+
+	return nil
 }
 
-func runSetup(yk *piv.YubiKey) {
+func RunSetup(yk *piv.YubiKey) {
+	log.SetFlags(0)
 	if _, err := yk.Certificate(piv.SlotAuthentication); err == nil {
 		log.Println("‼️  This YubiKey looks already setup")
 		log.Println("")
 		log.Println("If you want to wipe all PIV keys and start fresh,")
-		log.Fatalln("use --really-delete-all-piv-keys ⚠️")
+		log.Fatalln("use --really-delete-all-piv-keys ⚠⚠")
 	} else if !errors.Is(err, piv.ErrNotFound) {
 		log.Fatalln("Failed to access authentication slot:", err)
 	}
@@ -131,8 +137,8 @@ func runSetup(yk *piv.YubiKey) {
 	if err != nil {
 		log.Fatalln("Failed to read PIN:", err)
 	}
-	if len(pin) == 0 || len(pin) > 8 {
-		log.Fatalln("The PIN needs to be 1-8 characters.")
+	if len(pin) == 0 || len(pin) != 8 {
+		log.Fatalln("The PIN needs to be 8 characters.")
 	}
 	fmt.Print("Repeat PIN/PUK: ")
 	repeat, err := terminal.ReadPassword(int(os.Stdin.Fd()))
@@ -153,13 +159,14 @@ func runSetup(yk *piv.YubiKey) {
 	fmt.Println(" - 9c is for Digital Signature (PIN always checked)")
 	fmt.Println(" - 9d is for Key Management (PIN Once)")
 	fmt.Println(" - 9e is for Card Authentication (PIN never checked)")
+	fmt.Println("")
 
 	var key [24]byte
 	if _, err := rand.Read(key[:]); err != nil {
 		log.Fatal(err)
 	}
 	if err := yk.SetManagementKey(piv.DefaultManagementKey, key); err != nil {
-		log.Println("‼️  The default Management Key did not work")
+		log.Println("‼️ The default Management Key did not work")
 		log.Println("")
 		log.Println("If you know what you're doing, reset PIN, PUK, and")
 		log.Println("Management Key to the defaults before retrying.")
@@ -173,7 +180,7 @@ func runSetup(yk *piv.YubiKey) {
 		log.Fatalln("Failed to store the Management Key on the device:", err)
 	}
 	if err := yk.SetPIN(piv.DefaultPIN, string(pin)); err != nil {
-		log.Println("‼️  The default PIN did not work")
+		log.Println("‼️ The default PIN did not work")
 		log.Println("")
 		log.Println("If you know what you're doing, reset PIN, PUK, and")
 		log.Println("Management Key to the defaults before retrying.")
@@ -182,7 +189,7 @@ func runSetup(yk *piv.YubiKey) {
 		log.Fatalln("use --really-delete-all-piv-keys ⚠️")
 	}
 	if err := yk.SetPUK(piv.DefaultPUK, string(pin)); err != nil {
-		log.Println("‼️  The default PUK did not work")
+		log.Println("‼️ The default PUK did not work")
 		log.Println("")
 		log.Println("If you know what you're doing, reset PIN, PUK, and")
 		log.Println("Management Key to the defaults before retrying.")
@@ -191,22 +198,22 @@ func runSetup(yk *piv.YubiKey) {
 		log.Fatalln("use --really-delete-all-piv-keys ⚠️")
 	}
 
-	sshKey9a, err := generateAndStoreSshKey(yk, key, piv.SlotAuthentication, piv.PINPolicyOnce, piv.TouchPolicyAlways)
+	err = generateAndStoreSSHKey(yk, key, piv.SlotAuthentication, piv.PINPolicyOnce, piv.TouchPolicyAlways)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	sshKey9c, err := generateAndStoreSshKey(yk, key, piv.SlotSignature, piv.PINPolicyAlways, piv.TouchPolicyAlways)
+	err = generateAndStoreSSHKey(yk, key, piv.SlotSignature, piv.PINPolicyAlways, piv.TouchPolicyAlways)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	sshKey9d, err := generateAndStoreSshKey(yk, key, piv.SlotCardAuthentication, piv.PINPolicyOnce, piv.TouchPolicyNever)
+	err = generateAndStoreSSHKey(yk, key, piv.SlotCardAuthentication, piv.PINPolicyOnce, piv.TouchPolicyNever)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	sshKey9e, err := generateAndStoreSshKey(yk, key, piv.SlotKeyManagement, piv.PINPolicyNever, piv.TouchPolicyNever)
+	err = generateAndStoreSSHKey(yk, key, piv.SlotKeyManagement, piv.PINPolicyNever, piv.TouchPolicyNever)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -214,19 +221,6 @@ func runSetup(yk *piv.YubiKey) {
 	fmt.Println("")
 	fmt.Println("✅ Done! This YubiKey is secured and ready to go.")
 	fmt.Println("🤏 When the YubiKey blinks, touch it to authorize the login.")
-	fmt.Println("")
-	fmt.Println("🔑 Here's your new shiny SSH public key for slot 9a:")
-	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey9a))
-	fmt.Println("")
-	fmt.Println("🔑 Here's your new shiny SSH public key for slot 9c:")
-	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey9c))
-	fmt.Println("")
-	fmt.Println("🔑 Here's your new shiny SSH public key for slot 9d:")
-	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey9d))
-	fmt.Println("")
-	fmt.Println("🔑 Here's your new shiny SSH public key for slot 9e:")
-	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey9e))
-
 	fmt.Println("")
 	fmt.Println("Next steps: ensure yubikey-agent is running via launchd/systemd/...,")
 	fmt.Println(`set the SSH_AUTH_SOCK environment variable, and test with "ssh-add -L"`)
