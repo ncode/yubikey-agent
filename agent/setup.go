@@ -42,19 +42,6 @@ func init() {
 	Version = "(unknown version)"
 }
 
-func ConnectForSetup() *piv.YubiKey {
-	cards, err := ListYubiKeys()
-	if err != nil {
-		log.Fatalln(err)
-	}
-	// TODO: support multiple YubiKeys.
-	yk, err := piv.Open(cards[0])
-	if err != nil {
-		log.Fatalln("Failed to connect to the YubiKey:", err)
-	}
-	return yk
-}
-
 func RunReset(yk *piv.YubiKey) {
 	fmt.Println("Resetting YubiKey PIV applet...")
 	if err := yk.Reset(); err != nil {

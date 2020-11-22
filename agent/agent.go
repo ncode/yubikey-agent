@@ -42,27 +42,42 @@ var enabledSlots = []piv.Slot{
 	piv.SlotCardAuthentication,
 }
 
-// ListYubiKeys list all connected YubiKeys
-func ListYubiKeys() (yubikeys []string, err error) {
+// Yubi contains all the information about a YubiKey
+type Yubi struct {
+	Name   string
+	Device *piv.YubiKey
+	Serial uint32
+}
+
+// LoadYubiKeys load all connected YubiKeys, it's possible to filter and load only one passing the serial
+func LoadYubiKeys() (yubikeys []*Yubi, err error) {
 	cards, err := piv.Cards()
 	if err != nil {
 		return nil, err
 	}
+
 	if len(cards) == 0 {
 		return nil, errors.New("no smart card detected")
 	}
 
 	for _, card := range cards {
 		if strings.HasPrefix(strings.ToLower(card), "yubico") {
-			yubikeys = append(yubikeys, card)
+			yk, err := piv.Open(card)
+			if err != nil {
+				return nil, err
+			}
+			serial, _ := yk.Serial()
+			yubi := &Yubi{
+				Name:   card,
+				Serial: serial,
+				Device: yk,
+			}
+			yubikeys = append(yubikeys, yubi)
 		}
 	}
 
 	return yubikeys, err
 }
-
-// 	return nil, errors.New("no YubiKey detected")
-// }
 
 // Run executes the agent using the specified socket path
 func Run() {
@@ -161,18 +176,27 @@ func (a *Agent) ensureYK() error {
 }
 
 func (a *Agent) connectToYK() (*piv.YubiKey, error) {
-	cards, err := ListYubiKeys()
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	// TODO: support multiple YubiKeys.
-	yk, err := piv.Open(cards[0])
+	yubikeys, err := LoadYubiKeys()
 	if err != nil {
 		return nil, err
 	}
 
-	return yk, nil
+	if len(yubikeys) > 1 {
+		if viper.GetUint32("serial") == 0 {
+			return nil, fmt.Errorf("you must specify --serial when having more than one yubikey connected")
+		}
+
+		for _, key := range yubikeys {
+			if viper.GetUint32("serial") == key.Serial {
+				a.serial = key.Serial
+				return key.Device, nil
+			}
+		}
+	} else {
+		return yubikeys[0].Device, nil
+	}
+
+	return nil, fmt.Errorf("unable to connect to any YubiKey device")
 }
 
 // Close finish the connection to the YubiKey device and unlock it
