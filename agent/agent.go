@@ -181,18 +181,16 @@ func (a *Agent) connectToYK() (*piv.YubiKey, error) {
 		return nil, err
 	}
 
-	if len(yubikeys) > 1 {
-		if viper.GetUint32("serial") == 0 {
-			return nil, fmt.Errorf("you must specify --serial when having more than one yubikey connected")
-		}
-
+	serial := viper.GetUint32("serial")
+	if serial != 0 {
 		for _, key := range yubikeys {
-			if viper.GetUint32("serial") == key.Serial {
+			if serial == key.Serial {
 				a.serial = key.Serial
 				return key.Device, nil
 			}
 		}
-	} else {
+		return nil, fmt.Errorf("unable to find YubiKey with serial #%d", serial)
+	} else if len(yubikeys) == 1 {
 		return yubikeys[0].Device, nil
 	}
 
