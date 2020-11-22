@@ -253,7 +253,7 @@ func (a *Agent) List() ([]*agent.Key, error) {
 		k := &agent.Key{
 			Format:  pk.Type(),
 			Blob:    pk.Marshal(),
-			Comment: fmt.Sprintf("YubiKey %s #%d PIV Slot %x", a.yk.Name, a.yk.Serial, slot.Key),
+			Comment: fmt.Sprintf("%s #%d PIV Slot %x", a.yk.Name, a.yk.Serial, slot.Key),
 		}
 		keys = append(keys, k)
 	}
