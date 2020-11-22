@@ -62,15 +62,15 @@ func LoadYubiKeys() (yubikeys []*Yubi, err error) {
 
 	for _, card := range cards {
 		if strings.HasPrefix(strings.ToLower(card), "yubico") {
-			yk, err := piv.Open(card)
+			device, err := piv.Open(card)
 			if err != nil {
 				return nil, err
 			}
-			serial, _ := yk.Serial()
+			serial, _ := device.Serial()
 			yubi := &Yubi{
 				Name:   card,
 				Serial: serial,
-				Device: yk,
+				Device: device,
 			}
 			yubikeys = append(yubikeys, yubi)
 		}
@@ -133,9 +133,8 @@ func Run() {
 // Agent holds status of the current agent in use and
 // all yubikeys associated with it
 type Agent struct {
-	mu     sync.Mutex
-	yk     *piv.YubiKey
-	serial uint32
+	mu sync.Mutex
+	yk *Yubi
 
 	// touchNotification is armed by Sign to show a notification if waiting for
 	// more than a few seconds for the touch operation. It is paused and reset
@@ -159,10 +158,10 @@ func healthy(yk *piv.YubiKey) bool {
 }
 
 func (a *Agent) ensureYK() error {
-	if a.yk == nil || !healthy(a.yk) {
+	if a.yk == nil || !healthy(a.yk.Device) {
 		if a.yk != nil {
 			log.Println("Reconnecting to the YubiKey...")
-			a.yk.Close()
+			a.yk.Device.Close()
 		} else {
 			log.Println("Connecting to the YubiKey...")
 		}
@@ -175,7 +174,7 @@ func (a *Agent) ensureYK() error {
 	return nil
 }
 
-func (a *Agent) connectToYK() (*piv.YubiKey, error) {
+func (a *Agent) connectToYK() (*Yubi, error) {
 	yubikeys, err := LoadYubiKeys()
 	if err != nil {
 		return nil, err
@@ -183,15 +182,14 @@ func (a *Agent) connectToYK() (*piv.YubiKey, error) {
 
 	serial := viper.GetUint32("serial")
 	if serial != 0 {
-		for _, key := range yubikeys {
-			if serial == key.Serial {
-				a.serial = key.Serial
-				return key.Device, nil
+		for _, yk := range yubikeys {
+			if serial == yk.Serial {
+				return yk, nil
 			}
 		}
 		return nil, fmt.Errorf("unable to find YubiKey with serial #%d", serial)
 	} else if len(yubikeys) == 1 {
-		return yubikeys[0].Device, nil
+		return yubikeys[0], nil
 	}
 
 	return nil, fmt.Errorf("unable to connect to any YubiKey device")
@@ -203,7 +201,7 @@ func (a *Agent) Close() error {
 	defer a.mu.Unlock()
 	if a.yk != nil {
 		log.Println("Received SIGHUP, dropping YubiKey transaction...")
-		err := a.yk.Close()
+		err := a.yk.Device.Close()
 		a.yk = nil
 		return err
 	}
@@ -221,10 +219,10 @@ func (a *Agent) getPIN() (string, error) {
 	defer p.Close()
 	p.Set("title", "yubikey-agent PIN Prompt")
 	var retries string
-	if r, err := a.yk.Retries(); err == nil {
+	if r, err := a.yk.Device.Retries(); err == nil {
 		retries = fmt.Sprintf(" (%d tries remaining)", r)
 	}
-	p.Set("desc", fmt.Sprintf("YubiKey serial number: %d"+retries, a.serial))
+	p.Set("desc", fmt.Sprintf("YubiKey serial number: %d"+retries, a.yk.Serial))
 	p.Set("prompt", "Please enter your PIN:")
 
 	// Enable opt-in external PIN caching (in the OS keychain).
@@ -236,6 +234,7 @@ func (a *Agent) getPIN() (string, error) {
 	return string(pin), err
 }
 
+// List return a list with all available keys
 func (a *Agent) List() ([]*agent.Key, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -247,14 +246,14 @@ func (a *Agent) List() ([]*agent.Key, error) {
 	for _, slot := range enabledSlots {
 		var pk ssh.PublicKey
 		var err error
-		pk, err = getPublicKey(a.yk, slot)
+		pk, err = getPublicKey(a.yk.Device, slot)
 		if err != nil {
 			continue
 		}
 		k := &agent.Key{
 			Format:  pk.Type(),
 			Blob:    pk.Marshal(),
-			Comment: fmt.Sprintf("YubiKey #%d PIV Slot %x", a.serial, slot.Key),
+			Comment: fmt.Sprintf("YubiKey %s #%d PIV Slot %x", a.yk.Name, a.yk.Serial, slot.Key),
 		}
 		keys = append(keys, k)
 	}
@@ -292,11 +291,11 @@ func (a *Agent) Signers() ([]ssh.Signer, error) {
 func (a *Agent) signers() ([]ssh.Signer, error) {
 	var signers []ssh.Signer
 	for _, slot := range enabledSlots {
-		pk, err := getPublicKey(a.yk, slot)
+		pk, err := getPublicKey(a.yk.Device, slot)
 		if err != nil {
 			continue
 		}
-		priv, err := a.yk.PrivateKey(
+		priv, err := a.yk.Device.PrivateKey(
 			slot,
 			pk.(ssh.CryptoPublicKey).CryptoPublicKey(),
 			piv.KeyAuth{PINPrompt: a.getPIN},
