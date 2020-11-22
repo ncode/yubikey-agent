@@ -13,12 +13,12 @@ var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "list available YubiKey devices connected",
 	Run: func(cmd *cobra.Command, args []string) {
-		yubikeys, err := agent.ListYubiKeys()
+		yubikeys, err := agent.LoadYubiKeys()
 		if err != nil {
 			log.Fatalln(err)
 		}
-		for _, key := range yubikeys {
-			fmt.Printf("🔐 %s\n", key)
+		for _, yubi := range yubikeys {
+			fmt.Printf("🔐 %s #%d\n", yubi.Name, yubi.Serial)
 		}
 	},
 }
