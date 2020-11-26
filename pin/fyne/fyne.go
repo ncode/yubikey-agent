@@ -9,6 +9,32 @@ import (
 	"fyne.io/fyne/widget"
 )
 
+type passwordEntry struct {
+	widget.Entry
+}
+
+func newPasswordEntry() *passwordEntry {
+	e := &passwordEntry{}
+	e.ExtendBaseWidget(e)
+	e.Password = true
+	return e
+}
+
+func (e *passwordEntry) onEnter() {
+	fmt.Println(e.Entry.Text)
+	e.Entry.SetText("")
+}
+
+func (e *passwordEntry) TypedKey(key *fyne.KeyEvent) {
+	switch key.Name {
+	case fyne.KeyReturn:
+		e.onEnter()
+	default:
+		e.Entry.TypedKey(key)
+	}
+
+}
+
 func App() {
 	myApp := app.New()
 	fyne.CurrentApp().Settings().SetTheme(newCustomTheme())
@@ -18,25 +44,18 @@ func App() {
 
 	password := fyne.NewContainerWithLayout(layout.NewGridLayoutWithColumns(2))
 	passwordLabel := widget.NewLabel("Please enter your PIN: ")
-	passwordText := widget.NewPasswordEntry()
+	passwordText := newPasswordEntry()
 	password.AddObject(passwordLabel)
 	password.AddObject(passwordText)
-	//l := fyne.NewContainerWithLayout(layout.NewMaxLayout(), passwordText)
-	//password.Add(l)
 
 	buttons := fyne.NewContainerWithLayout(layout.NewHBoxLayout())
 	cancelButton := widget.NewButton("Cancel", func() {
-		fmt.Println("auth func()")
-		//authenticated = true
-		//myWindow.Hide()
-		//go showTasks(myApp)
+		myApp.Quit()
 	})
 	cancelButton.Alignment = widget.ButtonAlignTrailing
 	okButton := widget.NewButton("OK", func() {
 		fmt.Println(passwordText.Text)
-		//authenticated = true
-		//myWindow.Hide()
-		//go showTasks(myApp)
+		passwordText.SetText("")
 	})
 	okButton.Alignment = widget.ButtonAlignTrailing
 	buttons.AddObject(layout.NewSpacer())
@@ -50,6 +69,6 @@ func App() {
 	myWindow.SetPadded(true)
 	myWindow.SetFixedSize(true)
 	myWindow.CenterOnScreen()
-	myWindow.Resize(fyne.NewSize(400, 100))
+	myWindow.Resize(fyne.NewSize(350, 100))
 	myWindow.ShowAndRun()
 }
