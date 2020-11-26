@@ -14,10 +14,10 @@ type passwordEntry struct {
 }
 
 func newPasswordEntry() *passwordEntry {
-	e := &passwordEntry{}
-	e.ExtendBaseWidget(e)
-	e.Password = true
-	return e
+	p := &passwordEntry{}
+	p.ExtendBaseWidget(p)
+	p.Password = true
+	return p
 }
 
 func (e *passwordEntry) onEnter() {
@@ -32,25 +32,29 @@ func (e *passwordEntry) TypedKey(key *fyne.KeyEvent) {
 	default:
 		e.Entry.TypedKey(key)
 	}
-
 }
 
 func App() {
-	myApp := app.New()
+	yubiKeyPin := app.New()
 	fyne.CurrentApp().Settings().SetTheme(newCustomTheme())
 
-	myWindow := myApp.NewWindow("VBox Layout")
-	myWindow.SetTitle("YubiKey #sassdqewe (3 tries remaining)")
+	window := yubiKeyPin.NewWindow("YubiKey PIN")
+	window.SetTitle("YubiKey #sassdqewe (3 tries remaining)")
 
 	password := fyne.NewContainerWithLayout(layout.NewGridLayoutWithColumns(2))
 	passwordLabel := widget.NewLabel("Please enter your PIN: ")
 	passwordText := newPasswordEntry()
 	password.AddObject(passwordLabel)
 	password.AddObject(passwordText)
+	passwordText.OnChanged = func(s string) {
+		if len(passwordText.Text) > 8 {
+			passwordText.SetText(passwordText.Text[0:8])
+		}
+	}
 
 	buttons := fyne.NewContainerWithLayout(layout.NewHBoxLayout())
 	cancelButton := widget.NewButton("Cancel", func() {
-		myApp.Quit()
+		yubiKeyPin.Quit()
 	})
 	cancelButton.Alignment = widget.ButtonAlignTrailing
 	okButton := widget.NewButton("OK", func() {
@@ -61,14 +65,13 @@ func App() {
 	buttons.AddObject(layout.NewSpacer())
 	buttons.AddObject(cancelButton)
 	buttons.AddObject(okButton)
-	//		myWindow.Hide()
-	vbox := fyne.NewContainerWithLayout(layout.NewVBoxLayout(), password, buttons)
-	vbox.Resize(fyne.NewSize(400, 100))
-	pad := fyne.NewContainerWithLayout(layout.NewCenterLayout(), vbox)
-	myWindow.SetContent(pad)
-	myWindow.SetPadded(true)
-	myWindow.SetFixedSize(true)
-	myWindow.CenterOnScreen()
-	myWindow.Resize(fyne.NewSize(350, 100))
-	myWindow.ShowAndRun()
+
+	box := fyne.NewContainerWithLayout(layout.NewVBoxLayout(), password, buttons)
+	center := fyne.NewContainerWithLayout(layout.NewCenterLayout(), box)
+
+	window.SetContent(center)
+	window.SetPadded(true)
+	window.SetFixedSize(true)
+	window.Resize(fyne.NewSize(350, 100))
+	window.ShowAndRun()
 }
