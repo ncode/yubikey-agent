@@ -16,9 +16,8 @@ limitations under the License.
 package cmd
 
 import (
-	"time"
+	"github.com/ncode/yubikey-agent/pin/fyne"
 
-	"github.com/ncode/yubikey-agent/pin/ui"
 	"github.com/spf13/cobra"
 )
 
@@ -34,8 +33,7 @@ This application is a tool to generate the needed files
 to quickly create a Cobra application.`,
 	Run: func(cmd *cobra.Command, args []string) {
 		// go gio.Run("meh")
-		go ui.ReadPIN()
-		time.Sleep(200 * time.Minute)
+		fyne.App()
 	},
 }
 
