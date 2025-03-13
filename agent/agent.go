@@ -27,12 +27,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-piv/piv-go/piv"
-	"github.com/gopasspw/gopass/pkg/pinentry"
+	"github.com/go-piv/piv-go/v2/piv"
 	"github.com/spf13/viper"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 var enabledSlots = []piv.Slot{
@@ -81,14 +80,10 @@ func LoadYubiKeys() (yubikeys []*Yubi, err error) {
 
 // Run executes the agent using the specified socket path
 func Run() {
-	if _, err := exec.LookPath(pinentry.GetBinary()); err != nil {
-		log.Fatalf("PIN entry program %q not found!", pinentry.GetBinary())
-	}
-
 	socket := viper.GetString("listen")
 
 	log.Printf("Starting agent on socket %s...", socket)
-	if terminal.IsTerminal(int(os.Stdin.Fd())) {
+	if term.IsTerminal(int(os.Stdin.Fd())) {
 		log.Println("Warning: yubikey-agent is meant to run as a background daemon.")
 		log.Println("Running multiple instances is likely to lead to conflicts.")
 		log.Println("Consider using the launchd or systemd services.")
@@ -208,33 +203,7 @@ func (a *Agent) Close() error {
 	return nil
 }
 
-func (a *Agent) getPIN() (string, error) {
-	if a.touchNotification != nil && a.touchNotification.Stop() {
-		defer a.touchNotification.Reset(5 * time.Second)
-	}
-	p, err := pinentry.New()
-	if err != nil {
-		return "", fmt.Errorf("failed to start %q: %w", pinentry.GetBinary(), err)
-	}
-	defer p.Close()
-	p.Set("title", "yubikey-agent PIN Prompt")
-	var retries string
-	if r, err := a.yk.Device.Retries(); err == nil {
-		retries = fmt.Sprintf(" (%d tries remaining)", r)
-	}
-	p.Set("desc", fmt.Sprintf("YubiKey serial number: %d"+retries, a.yk.Serial))
-	p.Set("prompt", "Please enter your PIN:")
-
-	// Enable opt-in external PIN caching (in the OS keychain).
-	// https://gist.github.com/mdeguzis/05d1f284f931223624834788da045c65#file-info-pinentry-L324
-	// p.Option("allow-external-password-cache")
-	// p.Set("KEYINFO", fmt.Sprintf("--yubikey-id-%d", a.serial))
-
-	pin, err := p.GetPin()
-	return string(pin), err
-}
-
-// List return a list with all available keys
+// List returns a list of all available keys
 func (a *Agent) List() ([]*agent.Key, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -286,6 +255,14 @@ func (a *Agent) Signers() ([]ssh.Signer, error) {
 	}
 
 	return a.signers()
+}
+
+func (a *Agent) getPIN() (string, error) {
+	if a.touchNotification != nil && a.touchNotification.Stop() {
+		defer a.touchNotification.Reset(5 * time.Second)
+	}
+	r, _ := a.yk.Device.Retries()
+	return getPIN(a.yk.Serial, r)
 }
 
 func (a *Agent) signers() ([]ssh.Signer, error) {
@@ -359,12 +336,12 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 			if err != nil {
 				break
 			}
-
 			return sg, err
 		}
 		if err == nil {
 			return nil, fmt.Errorf("no private keys match the requested public key")
 		} else if strings.Contains(err.Error(), "remaining") {
+			// If the PIN prompt indicated we still have retries left, try again
 			continue
 		}
 		return nil, err
