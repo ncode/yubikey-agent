@@ -21,9 +21,9 @@ import (
 	"runtime/debug"
 	"time"
 
-	"github.com/go-piv/piv-go/piv"
+	"github.com/go-piv/piv-go/v2/piv"
 	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 // Version can be set at link time to override debug.BuildInfo.Main.Version,
@@ -50,7 +50,7 @@ func RunReset(yk *piv.YubiKey) {
 }
 
 // generateAndStoreSSHKey generates the key and store on the given slot and apply the expected touch policy
-func generateAndStoreSSHKey(yk *piv.YubiKey, key [24]byte, slot piv.Slot, policy piv.PINPolicy, touch piv.TouchPolicy) error {
+func generateAndStoreSSHKey(yk *piv.YubiKey, key []byte, slot piv.Slot, policy piv.PINPolicy, touch piv.TouchPolicy) error {
 	pub, err := yk.GenerateKey(key, slot, piv.Key{
 		Algorithm:   piv.AlgorithmEC256,
 		PINPolicy:   policy,
@@ -97,7 +97,7 @@ func generateAndStoreSSHKey(yk *piv.YubiKey, key [24]byte, slot piv.Slot, policy
 		return fmt.Errorf("Failed to generate public key for slot %x: %s", slot, err.Error())
 	}
 
-	fmt.Println("🔑 Here's your new shiny SSH public key for slot %x:", slot)
+	fmt.Printf("🔑 Here's your new shiny SSH public key for slot %x:\n", slot)
 	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey))
 	fmt.Println("")
 
@@ -119,7 +119,7 @@ func RunSetup(yk *piv.YubiKey) {
 	fmt.Println("❌ The key will be lost if the PIN and PUK are locked after 3 incorrect tries.")
 	fmt.Println("")
 	fmt.Print("Choose a new PIN/PUK: ")
-	pin, err := terminal.ReadPassword(int(os.Stdin.Fd()))
+	pin, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Print("\n")
 	if err != nil {
 		log.Fatalln("Failed to read PIN:", err)
@@ -128,7 +128,7 @@ func RunSetup(yk *piv.YubiKey) {
 		log.Fatalln("The PIN needs to be 8 characters.")
 	}
 	fmt.Print("Repeat PIN/PUK: ")
-	repeat, err := terminal.ReadPassword(int(os.Stdin.Fd()))
+	repeat, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Print("\n")
 	if err != nil {
 		log.Fatalln("Failed to read PIN:", err)
@@ -148,7 +148,7 @@ func RunSetup(yk *piv.YubiKey) {
 	fmt.Println(" - 9e is for Card Authentication (PIN never checked)")
 	fmt.Println("")
 
-	var key [24]byte
+	var key []byte
 	if _, err := rand.Read(key[:]); err != nil {
 		log.Fatal(err)
 	}
