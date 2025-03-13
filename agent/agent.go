@@ -31,7 +31,7 @@ import (
 	"github.com/spf13/viper"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
-	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/term"
 )
 
 var enabledSlots = []piv.Slot{
@@ -83,7 +83,7 @@ func Run() {
 	socket := viper.GetString("listen")
 
 	log.Printf("Starting agent on socket %s...", socket)
-	if terminal.IsTerminal(int(os.Stdin.Fd())) {
+	if term.IsTerminal(int(os.Stdin.Fd())) {
 		log.Println("Warning: yubikey-agent is meant to run as a background daemon.")
 		log.Println("Running multiple instances is likely to lead to conflicts.")
 		log.Println("Consider using the launchd or systemd services.")
