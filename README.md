@@ -33,51 +33,6 @@ Then add the following line to your `~/.zshrc` and restart the shell.
 export SSH_AUTH_SOCK="${HOME}/.ssh/yubikey-agent.sock"
 ```
 
-### Linux
-
-#### Arch
-
-On Arch, use [the `yubikey-agent` package](https://aur.archlinux.org/packages/yubikey-agent/) from the AUR.
-
-```
-git clone https://aur.archlinux.org/yubikey-agent.git
-cd yubikey-agent && makepkg -si
-
-systemctl daemon-reload --user
-sudo systemctl enable --now pcscd.socket
-systemctl --user enable --now yubikey-agent
-
-export SSH_AUTH_SOCK="${XDG_RUNTIME_DIR}/yubikey-agent/yubikey-agent.sock"
-```
-
-#### NixOS / nixpkgs
-
-On NixOS unstable and 20.09, you can add this to your `/etc/nixos/configuration.nix`:
-
-```
-services.yubikey-agent.enable = true;
-```
-
-This installs `yubikey-agent` and sets up a systemd unit to start yubikey-agent for you.
-
-On other systems using nix, you can also install from nixpkgs:
-
-```
-nix-env -iA nixpkgs.yubikey-agent
-```
-
-This installs the software but does *not* install a systemd unit. You will have to set up service management manually (see below).
-
-#### Other systemd-based Linux systems
-
-On other systemd-based Linux systems, follow [the manual installation instructions](systemd.md).
-
-Packaging contributions are very welcome.
-
-### FreeBSD
-
-Install the [`yubikey-agent` port](https://svnweb.freebsd.org/ports/head/security/yubikey-agent/).
-
 ### Windows
 
 Windows support is currently WIP.
@@ -85,44 +40,10 @@ Windows support is currently WIP.
 ## Commands
 
 ```
-yubikey-agent list    # List available YubiKey devices
-yubikey-agent setup   # Set up a YubiKey with SSH keys
+yubikey-agent list     # List available YubiKey devices
+yubikey-agent setup    # Set up a YubiKey with SSH keys\
+yubikey-agent unblock  # Unblock pin
 ```
-
-## Advanced topics
-
-### Coexisting with other `ssh-agent`s
-
-It's possible to configure `ssh-agent`s on a per-host basis.
-
-For example to only use `yubikey-agent` when connecting to `example.com`, you'd add the following lines to `~/.ssh/config` instead of setting `SSH_AUTH_SOCK`.
-
-```
-Host example.com
-    IdentityAgent /usr/local/var/run/yubikey-agent.sock
-```
-
-To use `yubikey-agent` for all hosts but one, you'd add the following lines instead. In both cases, you can keep using `ssh-add` to interact with the main `ssh-agent`.
-
-```
-Host example.com
-    IdentityAgent $SSH_AUTH_SOCK
-
-Host *
-    IdentityAgent /usr/local/var/run/yubikey-agent.sock
-```
-
-### Conflicts with `gpg-agent` and Yubikey Manager
-
-`yubikey-agent` takes a persistent transaction so the YubiKey will cache the PIN after first use. Unfortunately, this makes the YubiKey PIV and PGP applets unavailable to any other applications, like `gpg-agent` and Yubikey Manager.
-
-If you need `yubikey-agent` to release its lock on the YubiKey, send it a hangup signal. Likewise, you might have to kill `gpg-agent` after use for it to release its own lock.
-
-```
-killall -HUP yubikey-agent
-```
-
-This does not affect the FIDO2 functionality.
 
 ### Unblocking the PIN with the PUK
 
@@ -131,7 +52,7 @@ If the wrong PIN is entered incorrectly three times in a row, YubiKey Manager ca
 `yubikey-agent setup` sets the PUK to the same value as the PIN.
 
 ```
-ykman piv unblock-pin
+yubikey-agent unblock -s <serial>
 ```
 
 If the PUK is also entered incorrectly three times, the key is permanently irrecoverable. The YubiKey PIV applet can be reset with `yubikey-agent setup --really-delete-all-piv-keys`.
