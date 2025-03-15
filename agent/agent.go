@@ -298,7 +298,6 @@ func (a *Agent) getPINFor(yk *Yubi) func() (string, error) {
 	}
 }
 
-// signers gathers signers from all loaded YubiKeys.
 func (a *Agent) signers() ([]ssh.Signer, error) {
 	var signers []ssh.Signer
 	for _, yk := range a.yks {
@@ -376,6 +375,7 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 				return nil, err
 			}
 			return sg, nil
+
 		}
 		// If we found no matching private key, return an error.
 		return nil, fmt.Errorf("no private keys match the requested public key")
