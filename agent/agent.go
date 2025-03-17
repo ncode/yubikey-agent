@@ -1,4 +1,5 @@
 // Copyright 2020 Google LLC
+// Copyright 2025 Juliano Martinez <juliano@martinez.io>
 //
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file or at
@@ -48,34 +49,59 @@ type Yubi struct {
 	Serial uint32
 }
 
-// LoadYubiKeys load all connected YubiKeys, it's possible to filter and load only one passing the serial
-func LoadYubiKeys() (yubikeys []*Yubi, err error) {
+// LoadYubiKeys loads all connected YubiKeys, but if a `--serial` is provided,
+// only the matching YubiKey will be returned. This ensures we never "touch"
+// any other YubiKeys if `serial` is set.
+func LoadYubiKeys() ([]*Yubi, error) {
 	cards, err := piv.Cards()
 	if err != nil {
 		return nil, err
 	}
-
 	if len(cards) == 0 {
 		return nil, errors.New("no smart card detected")
 	}
 
+	serial := viper.GetUint32("serial")
+	var yubikeys []*Yubi
+
 	for _, card := range cards {
-		if strings.HasPrefix(strings.ToLower(card), "yubico") {
-			device, err := piv.Open(card)
-			if err != nil {
-				return nil, err
-			}
-			serial, _ := device.Serial()
-			yubi := &Yubi{
-				Name:   card,
-				Serial: serial,
-				Device: device,
-			}
-			yubikeys = append(yubikeys, yubi)
+		// Only consider Yubico cards
+		if !strings.HasPrefix(strings.ToLower(card), "yubico") {
+			continue
+		}
+		device, err := piv.Open(card)
+		if err != nil {
+			// Could not open this card; skip
+			continue
+		}
+		sn, _ := device.Serial()
+
+		// If a serial is provided and this doesn't match, skip this device entirely.
+		if serial != 0 && sn != serial {
+			device.Close()
+			continue
+		}
+
+		yubikeys = append(yubikeys, &Yubi{
+			Name:   card,
+			Serial: sn,
+			Device: device,
+		})
+
+		// If we were looking for a specific serial, we can stop early after finding it.
+		if serial != 0 {
+			break
 		}
 	}
 
-	return yubikeys, err
+	// If we have none, return an appropriate error message.
+	if len(yubikeys) == 0 {
+		if serial != 0 {
+			return nil, fmt.Errorf("unable to find YubiKey with serial #%d", serial)
+		}
+		return nil, errors.New("unable to connect to any YubiKey device")
+	}
+	return yubikeys, nil
 }
 
 // Run executes the agent using the specified socket path
@@ -109,19 +135,19 @@ func Run() {
 	}
 
 	for {
-		c, err := l.Accept()
+		conn, err := l.Accept()
 		if err != nil {
 			type temporary interface {
 				Temporary() bool
 			}
-			if err, ok := err.(temporary); ok && err.Temporary() {
+			if terr, ok := err.(temporary); ok && terr.Temporary() {
 				log.Println("Temporary Accept error, sleeping 1s:", err)
 				time.Sleep(1 * time.Second)
 				continue
 			}
 			log.Fatalln("Failed to accept connections:", err)
 		}
-		go a.serveConn(c)
+		go a.serveConn(conn)
 	}
 }
 
@@ -129,7 +155,9 @@ func Run() {
 // all yubikeys associated with it
 type Agent struct {
 	mu sync.Mutex
-	yk *Yubi
+
+	// Instead of a single YubiKey, store all discovered YubiKeys:
+	yks []*Yubi
 
 	// touchNotification is armed by Sign to show a notification if waiting for
 	// more than a few seconds for the touch operation. It is paused and reset
@@ -152,79 +180,80 @@ func healthy(yk *piv.YubiKey) bool {
 	return err == nil
 }
 
+// ensureYK checks if we still have healthy connections to our YubiKeys,
+// and reconnects if necessary.
 func (a *Agent) ensureYK() error {
-	if a.yk == nil || !healthy(a.yk.Device) {
-		if a.yk != nil {
-			log.Println("Reconnecting to the YubiKey...")
-			a.yk.Device.Close()
-		} else {
-			log.Println("Connecting to the YubiKey...")
+	// If we have at least one YubiKey, check if they're all healthy:
+	if len(a.yks) > 0 {
+		allHealthy := true
+		for _, yk := range a.yks {
+			if !healthy(yk.Device) {
+				allHealthy = false
+				break
+			}
 		}
-		yk, err := a.connectToYK()
-		if err != nil {
-			return err
+		if allHealthy {
+			return nil
 		}
-		a.yk = yk
+		// If any device isn't healthy, close and reload them all
+		for _, yk := range a.yks {
+			_ = yk.Device.Close()
+		}
+		a.yks = nil
+		log.Println("Reconnecting to the YubiKeys...")
 	}
+
+	// (Re)load
+	yks, err := a.connectToAllYubi()
+	if err != nil {
+		return err
+	}
+	a.yks = yks
 	return nil
 }
 
-func (a *Agent) connectToYK() (*Yubi, error) {
-	yubikeys, err := LoadYubiKeys()
-	if err != nil {
-		return nil, err
-	}
-
-	serial := viper.GetUint32("serial")
-	if serial != 0 {
-		for _, yk := range yubikeys {
-			if serial == yk.Serial {
-				return yk, nil
-			}
-		}
-		return nil, fmt.Errorf("unable to find YubiKey with serial #%d", serial)
-	} else if len(yubikeys) == 1 {
-		return yubikeys[0], nil
-	}
-
-	return nil, fmt.Errorf("unable to connect to any YubiKey device")
+// connectToAllYubi simply calls LoadYubiKeys() to retrieve
+// either the one matching serial or all if no serial is set.
+func (a *Agent) connectToAllYubi() ([]*Yubi, error) {
+	return LoadYubiKeys()
 }
 
-// Close finish the connection to the YubiKey device and unlock it
+// Close finishes the connection to the YubiKey devices.
 func (a *Agent) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.yk != nil {
-		log.Println("Received SIGHUP, dropping YubiKey transaction...")
-		err := a.yk.Device.Close()
-		a.yk = nil
-		return err
+	if len(a.yks) > 0 {
+		log.Println("Received SIGHUP, dropping YubiKey transaction(s)...")
+		for _, yk := range a.yks {
+			_ = yk.Device.Close()
+		}
+		a.yks = nil
 	}
 	return nil
 }
 
-// List returns a list of all available keys
+// List returns a list of all available keys from all YubiKeys.
 func (a *Agent) List() ([]*agent.Key, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.ensureYK(); err != nil {
-		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
+		return nil, fmt.Errorf("could not reach YubiKeys: %w", err)
 	}
 
 	var keys []*agent.Key
-	for _, slot := range enabledSlots {
-		var pk ssh.PublicKey
-		var err error
-		pk, err = getPublicKey(a.yk.Device, slot)
-		if err != nil {
-			continue
+	for _, yk := range a.yks {
+		for _, slot := range enabledSlots {
+			pk, err := getPublicKey(yk.Device, slot)
+			if err != nil {
+				continue
+			}
+			k := &agent.Key{
+				Format:  pk.Type(),
+				Blob:    pk.Marshal(),
+				Comment: fmt.Sprintf("%s #%d PIV Slot %x", yk.Name, yk.Serial, slot.Key),
+			}
+			keys = append(keys, k)
 		}
-		k := &agent.Key{
-			Format:  pk.Type(),
-			Blob:    pk.Marshal(),
-			Comment: fmt.Sprintf("%s #%d PIV Slot %x", a.yk.Name, a.yk.Serial, slot.Key),
-		}
-		keys = append(keys, k)
 	}
 	return keys, nil
 }
@@ -247,44 +276,50 @@ func getPublicKey(yk *piv.YubiKey, slot piv.Slot) (ssh.PublicKey, error) {
 	return pk, nil
 }
 
+// Signers returns signers for all available keys on all YubiKeys.
 func (a *Agent) Signers() ([]ssh.Signer, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.ensureYK(); err != nil {
-		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
+		return nil, fmt.Errorf("could not reach YubiKeys: %w", err)
 	}
 
 	return a.signers()
 }
 
-func (a *Agent) getPIN() (string, error) {
-	if a.touchNotification != nil && a.touchNotification.Stop() {
-		defer a.touchNotification.Reset(5 * time.Second)
+// getPINFor returns a function that prompts for the PIN for a specific YubiKey.
+func (a *Agent) getPINFor(yk *Yubi) func() (string, error) {
+	return func() (string, error) {
+		if a.touchNotification != nil && a.touchNotification.Stop() {
+			defer a.touchNotification.Reset(5 * time.Second)
+		}
+		r, _ := yk.Device.Retries()
+		return getPIN(yk.Serial, r)
 	}
-	r, _ := a.yk.Device.Retries()
-	return getPIN(a.yk.Serial, r)
 }
 
 func (a *Agent) signers() ([]ssh.Signer, error) {
 	var signers []ssh.Signer
-	for _, slot := range enabledSlots {
-		pk, err := getPublicKey(a.yk.Device, slot)
-		if err != nil {
-			continue
+	for _, yk := range a.yks {
+		for _, slot := range enabledSlots {
+			pk, err := getPublicKey(yk.Device, slot)
+			if err != nil {
+				continue
+			}
+			priv, err := yk.Device.PrivateKey(
+				slot,
+				pk.(ssh.CryptoPublicKey).CryptoPublicKey(),
+				piv.KeyAuth{PINPrompt: a.getPINFor(yk)},
+			)
+			if err != nil {
+				continue
+			}
+			s, err := ssh.NewSignerFromKey(priv)
+			if err != nil {
+				return nil, fmt.Errorf("failed to prepare signer from slot %x: %w", slot, err)
+			}
+			signers = append(signers, s)
 		}
-		priv, err := a.yk.Device.PrivateKey(
-			slot,
-			pk.(ssh.CryptoPublicKey).CryptoPublicKey(),
-			piv.KeyAuth{PINPrompt: a.getPIN},
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to prepare private key from slot %x: %w", slot, err)
-		}
-		s, err := ssh.NewSignerFromKey(priv)
-		if err != nil {
-			return nil, fmt.Errorf("failed to prepare signer from slot %x: %w", slot, err)
-		}
-		signers = append(signers, s)
 	}
 	return signers, nil
 }
@@ -297,7 +332,7 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.ensureYK(); err != nil {
-		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
+		return nil, fmt.Errorf("could not reach YubiKeys: %w", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -325,26 +360,25 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 
 			alg := key.Type()
 			switch {
-			case alg == ssh.KeyAlgoRSA && flags&agent.SignatureFlagRsaSha256 != 0:
+			case alg == ssh.KeyAlgoRSA && (flags&agent.SignatureFlagRsaSha256 != 0):
 				alg = ssh.SigAlgoRSASHA2256
-			case alg == ssh.KeyAlgoRSA && flags&agent.SignatureFlagRsaSha512 != 0:
+			case alg == ssh.KeyAlgoRSA && (flags&agent.SignatureFlagRsaSha512 != 0):
 				alg = ssh.SigAlgoRSASHA2512
 			}
 
-			var sg *ssh.Signature
-			sg, err = s.(ssh.AlgorithmSigner).SignWithAlgorithm(rand.Reader, data, alg)
+			sg, err := s.(ssh.AlgorithmSigner).SignWithAlgorithm(rand.Reader, data, alg)
 			if err != nil {
-				break
+				// If the PIN prompt indicated we still have retries left, try again
+				if strings.Contains(err.Error(), "remaining") {
+					continue
+				}
+				return nil, err
 			}
-			return sg, err
+			return sg, nil
+
 		}
-		if err == nil {
-			return nil, fmt.Errorf("no private keys match the requested public key")
-		} else if strings.Contains(err.Error(), "remaining") {
-			// If the PIN prompt indicated we still have retries left, try again
-			continue
-		}
-		return nil, err
+		// If we found no matching private key, return an error.
+		return nil, fmt.Errorf("no private keys match the requested public key")
 	}
 }
 

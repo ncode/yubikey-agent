@@ -1,4 +1,5 @@
 // Copyright 2020 Google LLC
+// Copyright 2025 Juliano Martinez <juliano@martinez.io>
 //
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file or at
@@ -222,4 +223,109 @@ func randomSerialNumber() *big.Int {
 		log.Fatalln("Failed to generate serial number:", err)
 	}
 	return serialNumber
+}
+
+// agent/setup.go (addition)
+
+// SetupSlot configures a single PIV slot with a specified PIN policy and touch policy
+func SetupSlot(yk *piv.YubiKey, slot piv.Slot, pinPolicy piv.PINPolicy, touchPolicy piv.TouchPolicy) {
+	log.SetFlags(0)
+
+	var managementKey []byte
+
+	// Check if management key is already set in metadata
+	metadata, err := yk.Metadata(string(piv.DefaultManagementKey))
+	if err == nil && metadata.ManagementKey != nil {
+		// Use the stored management key
+		managementKey = *metadata.ManagementKey
+		fmt.Println("🔐 Using existing management key from YubiKey metadata")
+	} else {
+		// We need to set up the management key, PIN and PUK
+		fmt.Println("🔐 No management key found in metadata. Need to set up YubiKey first.")
+		fmt.Println("")
+		fmt.Println("🔐 The PIN is up to 8 numbers, letters, or symbols. Not just numbers!")
+		fmt.Println("❌ The key will be lost if the PIN and PUK are locked after 3 incorrect tries.")
+		fmt.Println("")
+		fmt.Print("Choose a new PIN/PUK: ")
+		pin, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Print("\n")
+		if err != nil {
+			log.Fatalln("Failed to read PIN:", err)
+		}
+		if len(pin) == 0 || len(pin) != 8 {
+			log.Fatalln("The PIN needs to be 8 characters.")
+		}
+		fmt.Print("Repeat PIN/PUK: ")
+		repeat, err := term.ReadPassword(int(os.Stdin.Fd()))
+		fmt.Print("\n")
+		if err != nil {
+			log.Fatalln("Failed to read PIN:", err)
+		} else if !bytes.Equal(repeat, pin) {
+			log.Fatalln("PINs don't match!")
+		}
+
+		fmt.Println("")
+		fmt.Println("🧪 Setting up management key and PIN...")
+
+		// Generate a random management key
+		managementKey = make([]byte, 24)
+		if _, err := rand.Read(managementKey); err != nil {
+			log.Fatal(err)
+		}
+
+		// Set the management key
+		if err := yk.SetManagementKey(piv.DefaultManagementKey, managementKey); err != nil {
+			log.Println("‼️ The default Management Key did not work")
+			log.Println("")
+			log.Println("If you know what you're doing, reset PIN, PUK, and")
+			log.Println("Management Key to the defaults before retrying.")
+			log.Println("")
+			log.Println("If you want to wipe all PIV keys and start fresh,")
+			log.Fatalln("use setup --really-delete-all-piv-keys ⚠️")
+		}
+
+		// Store the management key in protected metadata
+		if err := yk.SetMetadata(managementKey, &piv.Metadata{
+			ManagementKey: &managementKey,
+		}); err != nil {
+			log.Fatalln("Failed to store the Management Key on the device:", err)
+		}
+
+		// Set the PIN and PUK
+		if err := yk.SetPIN(piv.DefaultPIN, string(pin)); err != nil {
+			log.Println("‼️ The default PIN did not work")
+			log.Println("")
+			log.Println("If you know what you're doing, reset PIN, PUK, and")
+			log.Println("Management Key to the defaults before retrying.")
+			log.Println("")
+			log.Println("If you want to wipe all PIV keys and start fresh,")
+			log.Fatalln("use setup --really-delete-all-piv-keys ⚠️")
+		}
+		if err := yk.SetPUK(piv.DefaultPUK, string(pin)); err != nil {
+			log.Println("‼️ The default PUK did not work")
+			log.Println("")
+			log.Println("If you know what you're doing, reset PIN, PUK, and")
+			log.Println("Management Key to the defaults before retrying.")
+			log.Println("")
+			log.Println("If you want to wipe all PIV keys and start fresh,")
+			log.Fatalln("use setup --really-delete-all-piv-keys ⚠️")
+		}
+	}
+
+	// Generate and store the SSH key for the specified slot
+	fmt.Printf("🔑 Generating SSH key for slot %x with PIN policy %v and touch policy %v\n",
+		slot.Key, pinPolicy, touchPolicy)
+
+	err = generateAndStoreSSHKey(yk, managementKey, slot, pinPolicy, touchPolicy)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	fmt.Println("")
+	fmt.Printf("✅ Done! Slot %x is configured with the specified policies.\n", slot.Key)
+	if touchPolicy == piv.TouchPolicyAlways {
+		fmt.Println("🤏 When the YubiKey blinks, touch it to authorize the login.")
+	}
+	fmt.Println("")
+	fmt.Println("Next steps: ensure yubikey-agent is running, and test with \"ssh-add -L\"")
 }

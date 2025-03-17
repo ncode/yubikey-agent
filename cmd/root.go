@@ -1,3 +1,9 @@
+// Copyright 2025 Juliano Martinez <juliano@martinez.io>
+//
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file or at
+// https://developers.google.com/open-source/licenses/bsd
+
 package cmd
 
 import (
@@ -68,5 +74,9 @@ func initConfig() {
 	// If a config file is found, read it in.
 	if err := viper.ReadInConfig(); err == nil {
 		fmt.Println("Using config file:", viper.ConfigFileUsed())
+	}
+
+	if viper.GetUint32("serial") != 0 {
+		fmt.Println("Using serial:", viper.GetUint32("serial"))
 	}
 }
