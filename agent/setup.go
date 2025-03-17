@@ -43,6 +43,7 @@ func init() {
 	Version = "(unknown version)"
 }
 
+// RunReset resets (factory-resets) the PIV applet on a single YubiKey.
 func RunReset(yk *piv.YubiKey) {
 	fmt.Println("Resetting YubiKey PIV applet...")
 	if err := yk.Reset(); err != nil {
@@ -50,65 +51,33 @@ func RunReset(yk *piv.YubiKey) {
 	}
 }
 
-// generateAndStoreSSHKey generates the key and store on the given slot and apply the expected touch policy
-func generateAndStoreSSHKey(yk *piv.YubiKey, key []byte, slot piv.Slot, policy piv.PINPolicy, touch piv.TouchPolicy) error {
-	pub, err := yk.GenerateKey(key, slot, piv.Key{
-		Algorithm:   piv.AlgorithmEC256,
-		PINPolicy:   policy,
-		TouchPolicy: touch,
-	})
+// RunResetSelected is a convenience wrapper that:
+//   - Loads YubiKeys (respecting --serial).
+//   - Ensures exactly one YubiKey was found.
+//   - Calls RunReset() on that single YubiKey.
+func RunResetSelected() {
+	yks, err := LoadYubiKeys() // your existing function respecting --serial
 	if err != nil {
-		return fmt.Errorf("Failed to generate key for slot %x: %s", slot, err.Error())
+		log.Fatalln("Failed to load YubiKeys:", err)
+	}
+	if len(yks) == 0 {
+		log.Fatalln("No YubiKey found.")
+	}
+	if len(yks) > 1 {
+		log.Fatalln("Multiple YubiKeys found. Please specify --serial or remove extra devices.")
 	}
 
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return fmt.Errorf("Failed to generate parent key for slot %x: %s", slot, err.Error())
-	}
-	parent := &x509.Certificate{
-		Subject: pkix.Name{
-			Organization:       []string{"yubikey-agent"},
-			OrganizationalUnit: []string{Version},
-		},
-		PublicKey: priv.Public(),
-	}
-	template := &x509.Certificate{
-		Subject: pkix.Name{
-			CommonName: "SSH key",
-		},
-		NotAfter:     time.Now().AddDate(42, 0, 0),
-		NotBefore:    time.Now(),
-		SerialNumber: randomSerialNumber(),
-		KeyUsage:     x509.KeyUsageKeyAgreement | x509.KeyUsageDigitalSignature,
-	}
-	certBytes, err := x509.CreateCertificate(rand.Reader, template, parent, pub, priv)
-	if err != nil {
-		return fmt.Errorf("Failed to generate certificate for slot %x: %s", slot, err.Error())
-	}
-	cert, err := x509.ParseCertificate(certBytes)
-	if err != nil {
-		return fmt.Errorf("Failed to parse certificate for slot %x: %s", slot, err.Error())
-	}
-	if err := yk.SetCertificate(key, slot, cert); err != nil {
-		return fmt.Errorf("Failed to store certificate on slot %x: %s", slot, err.Error())
-	}
-
-	sshKey, err := ssh.NewPublicKey(pub)
-	if err != nil {
-		return fmt.Errorf("Failed to generate public key for slot %x: %s", slot, err.Error())
-	}
-
-	fmt.Printf("🔑 Here's your new shiny SSH public key for slot %x:\n", slot)
-	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey))
-	fmt.Println("")
-
-	return nil
+	// Now we have exactly one
+	RunReset(yks[0].Device)
 }
 
+// RunSetup sets up all four main PIV slots on a single YubiKey, generating
+// SSH-usable certificates in each. This function expects you’ve already
+// selected your one YubiKey, e.g. via RunSetupSelected().
 func RunSetup(yk *piv.YubiKey) {
 	log.SetFlags(0)
 	if _, err := yk.Certificate(piv.SlotAuthentication); err == nil {
-		log.Println("‼️  This YubiKey looks already setup")
+		log.Println("‼️  This YubiKey looks already set up")
 		log.Println("")
 		log.Println("If you want to wipe all PIV keys and start fresh,")
 		log.Fatalln("use --really-delete-all-piv-keys ⚠⚠")
@@ -149,8 +118,9 @@ func RunSetup(yk *piv.YubiKey) {
 	fmt.Println(" - 9e is for Card Authentication (PIN never checked)")
 	fmt.Println("")
 
-	var key []byte
-	if _, err := rand.Read(key[:]); err != nil {
+	// Generate a random new management key
+	key := make([]byte, 24)
+	if _, err := rand.Read(key); err != nil {
 		log.Fatal(err)
 	}
 	if err := yk.SetManagementKey(piv.DefaultManagementKey, key); err != nil {
@@ -186,6 +156,7 @@ func RunSetup(yk *piv.YubiKey) {
 		log.Fatalln("use --really-delete-all-piv-keys ⚠️")
 	}
 
+	// Now generate our four keys (slots 9a, 9c, 9e, 9d)
 	err = generateAndStoreSSHKey(yk, key, piv.SlotAuthentication, piv.PINPolicyOnce, piv.TouchPolicyAlways)
 	if err != nil {
 		log.Fatal(err)
@@ -225,22 +196,82 @@ func randomSerialNumber() *big.Int {
 	return serialNumber
 }
 
-// agent/setup.go (addition)
+// generateAndStoreSSHKey generates a new EC key on the given slot (with the
+// specified PIN/touch policies), creates a self-signed certificate for it,
+// and prints out the SSH public key.
+func generateAndStoreSSHKey(yk *piv.YubiKey, key []byte, slot piv.Slot, policy piv.PINPolicy, touch piv.TouchPolicy) error {
+	pub, err := yk.GenerateKey(key, slot, piv.Key{
+		Algorithm:   piv.AlgorithmEC256,
+		PINPolicy:   policy,
+		TouchPolicy: touch,
+	})
+	if err != nil {
+		return fmt.Errorf("Failed to generate key for slot %x: %w", slot.Key, err)
+	}
 
-// SetupSlot configures a single PIV slot with a specified PIN policy and touch policy
+	// Create a dummy self-signed cert:
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return fmt.Errorf("Failed to generate parent key for slot %x: %w", slot.Key, err)
+	}
+	parent := &x509.Certificate{
+		Subject: pkix.Name{
+			Organization:       []string{"yubikey-agent"},
+			OrganizationalUnit: []string{Version},
+		},
+		PublicKey: priv.Public(),
+	}
+	template := &x509.Certificate{
+		Subject: pkix.Name{
+			CommonName: "SSH key",
+		},
+		NotAfter:     time.Now().AddDate(42, 0, 0), // arbitrary far future
+		NotBefore:    time.Now(),
+		SerialNumber: randomSerialNumber(),
+		KeyUsage:     x509.KeyUsageKeyAgreement | x509.KeyUsageDigitalSignature,
+	}
+	certBytes, err := x509.CreateCertificate(rand.Reader, template, parent, pub, priv)
+	if err != nil {
+		return fmt.Errorf("Failed to generate certificate for slot %x: %w", slot.Key, err)
+	}
+	cert, err := x509.ParseCertificate(certBytes)
+	if err != nil {
+		return fmt.Errorf("Failed to parse certificate for slot %x: %w", slot.Key, err)
+	}
+	if err := yk.SetCertificate(key, slot, cert); err != nil {
+		return fmt.Errorf("Failed to store certificate on slot %x: %w", slot.Key, err)
+	}
+
+	sshKey, err := ssh.NewPublicKey(pub)
+	if err != nil {
+		return fmt.Errorf("Failed to generate public key for slot %x: %w", slot.Key, err)
+	}
+
+	fmt.Printf("🔑 Here's your new shiny SSH public key for slot %x:\n", slot.Key)
+	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey))
+	fmt.Println("")
+
+	return nil
+}
+
+// SetupSlot configures (or re-configures) a single PIV slot with a specified
+// PIN policy and touch policy. Demonstrates a more “incremental” approach,
+// rather than setting up all slots at once.
+//
+// If a management key is not yet stored in metadata, it will prompt for a PIN
+// (resetting from defaults). Otherwise, it reuses the existing management key.
 func SetupSlot(yk *piv.YubiKey, slot piv.Slot, pinPolicy piv.PINPolicy, touchPolicy piv.TouchPolicy) {
 	log.SetFlags(0)
 
 	var managementKey []byte
 
-	// Check if management key is already set in metadata
+	// Attempt to load an existing management key from the YubiKey’s metadata
 	metadata, err := yk.Metadata(string(piv.DefaultManagementKey))
 	if err == nil && metadata.ManagementKey != nil {
-		// Use the stored management key
 		managementKey = *metadata.ManagementKey
 		fmt.Println("🔐 Using existing management key from YubiKey metadata")
 	} else {
-		// We need to set up the management key, PIN and PUK
+		// Need to set up the management key, PIN, and PUK from defaults
 		fmt.Println("🔐 No management key found in metadata. Need to set up YubiKey first.")
 		fmt.Println("")
 		fmt.Println("🔐 The PIN is up to 8 numbers, letters, or symbols. Not just numbers!")
@@ -267,13 +298,12 @@ func SetupSlot(yk *piv.YubiKey, slot piv.Slot, pinPolicy piv.PINPolicy, touchPol
 		fmt.Println("")
 		fmt.Println("🧪 Setting up management key and PIN...")
 
-		// Generate a random management key
 		managementKey = make([]byte, 24)
 		if _, err := rand.Read(managementKey); err != nil {
 			log.Fatal(err)
 		}
 
-		// Set the management key
+		// Update the YubiKey from default credentials → new random management key
 		if err := yk.SetManagementKey(piv.DefaultManagementKey, managementKey); err != nil {
 			log.Println("‼️ The default Management Key did not work")
 			log.Println("")
@@ -284,14 +314,14 @@ func SetupSlot(yk *piv.YubiKey, slot piv.Slot, pinPolicy piv.PINPolicy, touchPol
 			log.Fatalln("use setup --really-delete-all-piv-keys ⚠️")
 		}
 
-		// Store the management key in protected metadata
+		// Store management key in protected metadata
 		if err := yk.SetMetadata(managementKey, &piv.Metadata{
 			ManagementKey: &managementKey,
 		}); err != nil {
 			log.Fatalln("Failed to store the Management Key on the device:", err)
 		}
 
-		// Set the PIN and PUK
+		// Update PIN and PUK from default
 		if err := yk.SetPIN(piv.DefaultPIN, string(pin)); err != nil {
 			log.Println("‼️ The default PIN did not work")
 			log.Println("")
@@ -312,12 +342,11 @@ func SetupSlot(yk *piv.YubiKey, slot piv.Slot, pinPolicy piv.PINPolicy, touchPol
 		}
 	}
 
-	// Generate and store the SSH key for the specified slot
+	// Generate/store the key in the given slot
 	fmt.Printf("🔑 Generating SSH key for slot %x with PIN policy %v and touch policy %v\n",
 		slot.Key, pinPolicy, touchPolicy)
 
-	err = generateAndStoreSSHKey(yk, managementKey, slot, pinPolicy, touchPolicy)
-	if err != nil {
+	if err := generateAndStoreSSHKey(yk, managementKey, slot, pinPolicy, touchPolicy); err != nil {
 		log.Fatal(err)
 	}
 
@@ -328,4 +357,23 @@ func SetupSlot(yk *piv.YubiKey, slot piv.Slot, pinPolicy piv.PINPolicy, touchPol
 	}
 	fmt.Println("")
 	fmt.Println("Next steps: ensure yubikey-agent is running, and test with \"ssh-add -L\"")
+}
+
+// RunSetupSelected is a convenience wrapper that:
+//   - Loads YubiKeys (respecting --serial).
+//   - Ensures exactly one YubiKey was found.
+//   - Calls RunSetup(...) on that single YubiKey.
+func RunSetupSelected() {
+	yks, err := LoadYubiKeys() // your existing function that filters by --serial
+	if err != nil {
+		log.Fatalln("Failed to load YubiKeys:", err)
+	}
+	if len(yks) == 0 {
+		log.Fatalln("No YubiKey found.")
+	}
+	if len(yks) > 1 {
+		log.Fatalln("Multiple YubiKeys found. Please specify --serial or remove extra devices.")
+	}
+
+	RunSetup(yks[0].Device)
 }
