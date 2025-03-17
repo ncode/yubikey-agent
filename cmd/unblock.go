@@ -16,13 +16,7 @@ import (
 // unblockCmd represents the unblock command
 var unblockCmd = &cobra.Command{
 	Use:   "unblock",
-	Short: "A brief description of your command",
-	Long: `A longer description that spans multiple lines and likely contains examples
-and usage of using your command. For example:
-
-Cobra is a CLI library for Go that empowers applications.
-This application is a tool to generate the needed files
-to quickly create a Cobra application.`,
+	Short: "unblocks the specified YubiKey",
 	Run: func(cmd *cobra.Command, args []string) {
 		yubikeys, err := agent.LoadYubiKeys()
 		if err != nil {
@@ -53,14 +47,4 @@ to quickly create a Cobra application.`,
 
 func init() {
 	rootCmd.AddCommand(unblockCmd)
-
-	// Here you will define your flags and configuration settings.
-
-	// Cobra supports Persistent Flags which will work for this command
-	// and all subcommands, e.g.:
-	// unblockCmd.PersistentFlags().String("foo", "", "A help for foo")
-
-	// Cobra supports local flags which will only run when this command
-	// is called directly, e.g.:
-	// unblockCmd.Flags().BoolP("toggle", "t", false, "Help message for toggle")
 }

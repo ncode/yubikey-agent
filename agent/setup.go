@@ -206,13 +206,13 @@ func generateAndStoreSSHKey(yk *piv.YubiKey, key []byte, slot piv.Slot, policy p
 		TouchPolicy: touch,
 	})
 	if err != nil {
-		return fmt.Errorf("Failed to generate key for slot %x: %w", slot.Key, err)
+		return fmt.Errorf("failed to generate key for slot %x: %w", slot.Key, err)
 	}
 
 	// Create a dummy self-signed cert:
 	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return fmt.Errorf("Failed to generate parent key for slot %x: %w", slot.Key, err)
+		return fmt.Errorf("failed to generate parent key for slot %x: %w", slot.Key, err)
 	}
 	parent := &x509.Certificate{
 		Subject: pkix.Name{
@@ -232,19 +232,19 @@ func generateAndStoreSSHKey(yk *piv.YubiKey, key []byte, slot piv.Slot, policy p
 	}
 	certBytes, err := x509.CreateCertificate(rand.Reader, template, parent, pub, priv)
 	if err != nil {
-		return fmt.Errorf("Failed to generate certificate for slot %x: %w", slot.Key, err)
+		return fmt.Errorf("failed to generate certificate for slot %x: %w", slot.Key, err)
 	}
 	cert, err := x509.ParseCertificate(certBytes)
 	if err != nil {
-		return fmt.Errorf("Failed to parse certificate for slot %x: %w", slot.Key, err)
+		return fmt.Errorf("failed to parse certificate for slot %x: %w", slot.Key, err)
 	}
 	if err := yk.SetCertificate(key, slot, cert); err != nil {
-		return fmt.Errorf("Failed to store certificate on slot %x: %w", slot.Key, err)
+		return fmt.Errorf("failed to store certificate on slot %x: %w", slot.Key, err)
 	}
 
 	sshKey, err := ssh.NewPublicKey(pub)
 	if err != nil {
-		return fmt.Errorf("Failed to generate public key for slot %x: %w", slot.Key, err)
+		return fmt.Errorf("failed to generate public key for slot %x: %w", slot.Key, err)
 	}
 
 	fmt.Printf("🔑 Here's your new shiny SSH public key for slot %x:\n", slot.Key)
