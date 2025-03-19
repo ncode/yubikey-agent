@@ -7,7 +7,8 @@
 package cmd
 
 import (
-	"log"
+	"fmt"
+	"os"
 
 	"github.com/ncode/yubikey-agent/agent"
 	"github.com/spf13/cobra"
@@ -18,29 +19,16 @@ var unblockCmd = &cobra.Command{
 	Use:   "unblock",
 	Short: "unblocks the specified YubiKey",
 	Run: func(cmd *cobra.Command, args []string) {
-		yubikeys, err := agent.LoadYubiKeys()
+		yk, err := agent.GetSingleYubiKey()
 		if err != nil {
-			log.Fatalln(err)
+			fmt.Println(err)
+			os.Exit(1)
 		}
 
-		if len(yubikeys) == 1 {
-			err = agent.UnblockPIN(yubikeys[0].Device)
-			if err != nil {
-				log.Fatalln(err)
-			}
-		} else {
-			if serial == 0 {
-				log.Fatalln("you must specify --serial when having more than one yubikey connected")
-			}
-
-			for _, key := range yubikeys {
-				if uint32(serial) == key.Serial {
-					err = agent.UnblockPIN(key.Device)
-					if err != nil {
-						log.Fatalln(err)
-					}
-				}
-			}
+		err = agent.UnblockPIN(yk.Device)
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
 		}
 	},
 }
