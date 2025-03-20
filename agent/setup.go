@@ -19,7 +19,6 @@ import (
 	"log"
 	"math/big"
 	"os"
-	"runtime/debug"
 	"time"
 
 	"github.com/go-piv/piv-go/v2/piv"
@@ -27,48 +26,25 @@ import (
 	"golang.org/x/term"
 )
 
-// Version can be set at link time to override debug.BuildInfo.Main.Version,
-// which is "(devel)" when building from within the module. See
-// golang.org/issue/29814 and golang.org/issue/29228.
 var Version string
 
-func init() {
-	if Version != "" {
-		return
-	}
-	if buildInfo, ok := debug.ReadBuildInfo(); ok {
-		Version = buildInfo.Main.Version
-		return
-	}
-	Version = "(unknown version)"
-}
-
-// RunReset resets (factory-resets) the PIV applet on a single YubiKey.
-func RunReset(yk *piv.YubiKey) {
-	fmt.Println("Resetting YubiKey PIV applet...")
-	if err := yk.Reset(); err != nil {
-		log.Fatalln("Failed to reset YubiKey:", err)
-	}
-}
-
-// RunResetSelected is a convenience wrapper that:
-//   - Loads YubiKeys (respecting --serial).
-//   - Ensures exactly one YubiKey was found.
-//   - Calls RunReset() on that single YubiKey.
-func RunResetSelected() {
-	yks, err := LoadYubiKeys() // your existing function respecting --serial
+// getSingleYubiKey loads YubiKeys (respecting --serial) and ensures exactly one is found.
+// Returns the YubiKey and nil if successful, or nil and an error if failed.
+func GetSingleYubiKey() (*Yubi, error) {
+	yks, err := LoadYubiKeys()
 	if err != nil {
-		log.Fatalln("Failed to load YubiKeys:", err)
-	}
-	if len(yks) == 0 {
-		log.Fatalln("No YubiKey found.")
-	}
-	if len(yks) > 1 {
-		log.Fatalln("Multiple YubiKeys found. Please specify --serial or remove extra devices.")
+		return nil, fmt.Errorf("failed to load YubiKeys: %w", err)
 	}
 
-	// Now we have exactly one
-	RunReset(yks[0].Device)
+	if len(yks) == 0 {
+		return nil, errors.New("no YubiKey found")
+	}
+
+	if len(yks) > 1 {
+		return nil, errors.New("multiple YubiKeys found; please specify --serial or remove extra devices")
+	}
+
+	return yks[0], nil
 }
 
 // RunSetup sets up all four main PIV slots on a single YubiKey, generating
@@ -357,23 +333,4 @@ func SetupSlot(yk *piv.YubiKey, slot piv.Slot, pinPolicy piv.PINPolicy, touchPol
 	}
 	fmt.Println("")
 	fmt.Println("Next steps: ensure yubikey-agent is running, and test with \"ssh-add -L\"")
-}
-
-// RunSetupSelected is a convenience wrapper that:
-//   - Loads YubiKeys (respecting --serial).
-//   - Ensures exactly one YubiKey was found.
-//   - Calls RunSetup(...) on that single YubiKey.
-func RunSetupSelected() {
-	yks, err := LoadYubiKeys() // your existing function that filters by --serial
-	if err != nil {
-		log.Fatalln("Failed to load YubiKeys:", err)
-	}
-	if len(yks) == 0 {
-		log.Fatalln("No YubiKey found.")
-	}
-	if len(yks) > 1 {
-		log.Fatalln("Multiple YubiKeys found. Please specify --serial or remove extra devices.")
-	}
-
-	RunSetup(yks[0].Device)
 }

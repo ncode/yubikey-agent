@@ -7,7 +7,8 @@
 package cmd
 
 import (
-	"log"
+	"fmt"
+	"os"
 
 	"github.com/ncode/yubikey-agent/agent"
 
@@ -22,29 +23,19 @@ var setupCmd = &cobra.Command{
 	Use:   "setup",
 	Short: "setup the specified YubiKey",
 	Run: func(cmd *cobra.Command, args []string) {
-		yubikeys, err := agent.LoadYubiKeys()
+		yk, err := agent.GetSingleYubiKey()
 		if err != nil {
-			log.Fatalln(err)
+			fmt.Println(err)
+			os.Exit(1)
 		}
-		if len(yubikeys) == 1 {
-			if reallyDeleteAllPivKeys {
-				agent.RunReset(yubikeys[0].Device)
-			}
-			agent.RunSetup(yubikeys[0].Device)
-		} else {
-			if serial == 0 {
-				log.Fatalln("you must specify --serial when having more than one yubikey connected")
-			}
-
-			for _, key := range yubikeys {
-				if uint32(serial) == key.Serial {
-					if reallyDeleteAllPivKeys {
-						agent.RunReset(key.Device)
-					}
-					agent.RunSetup(key.Device)
-				}
+		if reallyDeleteAllPivKeys {
+			fmt.Println("Resetting YubiKey PIV applet...")
+			if err := yk.Device.Reset(); err != nil {
+				fmt.Println(err)
+				os.Exit(1)
 			}
 		}
+		agent.RunSetup(yk.Device)
 	},
 }
 

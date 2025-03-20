@@ -204,18 +204,12 @@ func (a *Agent) ensureYK() error {
 	}
 
 	// (Re)load
-	yks, err := a.connectToAllYubi()
+	yks, err := LoadYubiKeys()
 	if err != nil {
 		return err
 	}
 	a.yks = yks
 	return nil
-}
-
-// connectToAllYubi simply calls LoadYubiKeys() to retrieve
-// either the one matching serial or all if no serial is set.
-func (a *Agent) connectToAllYubi() ([]*Yubi, error) {
-	return LoadYubiKeys()
 }
 
 // Close finishes the connection to the YubiKey devices.

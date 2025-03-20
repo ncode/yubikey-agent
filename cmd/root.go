@@ -9,6 +9,7 @@ package cmd
 import (
 	"fmt"
 	"os"
+	"runtime/debug"
 
 	"github.com/ncode/yubikey-agent/agent"
 	"github.com/spf13/cobra"
@@ -17,6 +18,9 @@ import (
 	"github.com/spf13/viper"
 )
 
+// Version is the version of the agent. It is set at build time using the following command:
+// go build -ldflags "-X github.com/ncode/yubikey-agent/cmd.Version="
+var Version string
 var cfgFile string
 
 // rootCmd represents the base command when called without any subcommands
@@ -49,6 +53,15 @@ func init() {
 	viper.BindPFlag("serial", rootCmd.PersistentFlags().Lookup("serial"))
 	rootCmd.PersistentFlags().StringP("listen", "l", fmt.Sprintf("%s/.ssh/yubikey-agent.sock", home), "Run the agent, listening on the UNIX socket at PATH (default is $HOME/.ssh.yubikey-agent.sock)")
 	viper.BindPFlag("listen", rootCmd.PersistentFlags().Lookup("listen"))
+
+	if Version != "" {
+		rootCmd.Version = Version
+	} else if buildInfo, ok := debug.ReadBuildInfo(); ok {
+		rootCmd.Version = buildInfo.Main.Version
+	} else {
+		rootCmd.Version = "(unknown version)"
+	}
+	agent.Version = rootCmd.Version
 }
 
 // initConfig reads in config file and ENV variables if set.
