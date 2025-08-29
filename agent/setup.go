@@ -97,7 +97,7 @@ func generateAndStoreSSHKey(yk *piv.YubiKey, key [24]byte, slot piv.Slot, policy
 		return fmt.Errorf("Failed to generate public key for slot %x: %s", slot, err.Error())
 	}
 
-	fmt.Println("🔑 Here's your new shiny SSH public key for slot %x:", slot)
+	fmt.Printf("🔑 Here's your new shiny SSH public key for slot %x:\n", slot)
 	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey))
 	fmt.Println("")
 

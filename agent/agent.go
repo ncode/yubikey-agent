@@ -52,13 +52,32 @@ func LoadYubiKeys() (yubikeys []*Yubi, err error) {
 		return nil, errors.New("no smart card detected")
 	}
 
+	// Track opened devices for cleanup on error
+	var openedDevices []*piv.YubiKey
+	defer func() {
+		if err != nil {
+			// Close all opened devices if we're returning an error
+			for _, d := range openedDevices {
+				if closeErr := d.Close(); closeErr != nil {
+					log.Printf("Warning: failed to close device during cleanup: %v", closeErr)
+				}
+			}
+		}
+	}()
+
 	for _, card := range cards {
 		if strings.HasPrefix(strings.ToLower(card), "yubico") {
 			device, err := piv.Open(card)
 			if err != nil {
-				return nil, err
+				return nil, fmt.Errorf("failed to open device %s: %w", card, err)
 			}
-			serial, _ := device.Serial()
+			openedDevices = append(openedDevices, device)
+
+			serial, err := device.Serial()
+			if err != nil {
+				// Log the error but continue with serial 0
+				log.Printf("Warning: failed to get serial for %s: %v", card, err)
+			}
 			yubi := &Yubi{
 				Name:   card,
 				Serial: serial,
@@ -71,35 +90,20 @@ func LoadYubiKeys() (yubikeys []*Yubi, err error) {
 	return yubikeys, nil
 }
 
-// storedKey holds a local (non-YubiKey) key in memory.
-type storedKey struct {
-	privateKey       interface{}      // The actual private key
-	certificate      *ssh.Certificate // optional
-	comment          string
-	lifetimeSecs     uint32
-	confirmBeforeUse bool
-}
-
-// Agent combines YubiKey-based keys with local ephemeral keys.
+// Agent manages YubiKey-based SSH keys.
 type Agent struct {
 	mu sync.Mutex
 	yk *Yubi
 
 	touchNotification *time.Timer
-
-	// Local key support:
-	localKeys      map[string]*storedKey
-	locked         bool
-	lockPassphrase []byte
+	touchMu           sync.Mutex // Separate mutex for touch notification
 }
 
-// Ensure Agent implements agent.ExtendedAgent
-var _ agent.ExtendedAgent = &Agent{}
+// Ensure Agent implements agent.Agent
+var _ agent.Agent = &Agent{}
 
 func NewAgent() *Agent {
-	return &Agent{
-		localKeys: make(map[string]*storedKey),
-	}
+	return &Agent{}
 }
 
 // Run starts the agent listening on a Unix socket specified by `listen`.
@@ -115,7 +119,7 @@ func Run() {
 
 	a := NewAgent()
 
-	c := make(chan os.Signal)
+	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGHUP)
 	go func() {
 		for range c {
@@ -124,8 +128,10 @@ func Run() {
 	}()
 
 	// Remove any stale socket, then create its directory
-	_ = os.Remove(socket)
-	if err := os.MkdirAll(filepath.Dir(socket), 0777); err != nil {
+	if err := os.Remove(socket); err != nil && !os.IsNotExist(err) {
+		log.Printf("Warning: failed to remove stale socket: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(socket), 0700); err != nil {
 		log.Fatalln("Failed to create UNIX socket folder:", err)
 	}
 	l, err := net.Listen("unix", socket)
@@ -160,6 +166,15 @@ func (a *Agent) serveConn(c net.Conn) {
 func (a *Agent) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	// Also clean up touch notification
+	a.touchMu.Lock()
+	if a.touchNotification != nil {
+		a.touchNotification.Stop()
+		a.touchNotification = nil
+	}
+	a.touchMu.Unlock()
+
 	if a.yk != nil {
 		log.Println("Received SIGHUP, dropping YubiKey transaction...")
 		err := a.yk.Device.Close()
@@ -182,7 +197,9 @@ func (a *Agent) ensureYK() error {
 	if a.yk == nil || !healthy(a.yk.Device) {
 		if a.yk != nil {
 			log.Println("Reconnecting to the YubiKey...")
-			_ = a.yk.Device.Close()
+			if err := a.yk.Device.Close(); err != nil {
+				log.Printf("Warning: failed to close previous YubiKey connection: %v", err)
+			}
 		} else {
 			log.Println("Connecting to the YubiKey...")
 		}
@@ -233,9 +250,17 @@ func getPublicKey(yk *piv.YubiKey, slot piv.Slot) (ssh.PublicKey, error) {
 }
 
 func (a *Agent) getPIN() (string, error) {
+	// Use separate mutex for touch notification
+	a.touchMu.Lock()
 	if a.touchNotification != nil && a.touchNotification.Stop() {
-		defer a.touchNotification.Reset(5 * time.Second)
+		defer func() {
+			a.touchNotification.Reset(5 * time.Second)
+			a.touchMu.Unlock()
+		}()
+	} else {
+		a.touchMu.Unlock()
 	}
+
 	r, _ := a.yk.Device.Retries()
 	// NOTE: getPIN is implemented in prompt_darwin.go or prompt_pinentry.go
 	return getPIN(a.yk.Serial, r)
@@ -266,51 +291,31 @@ func (a *Agent) signersYubi() ([]ssh.Signer, error) {
 }
 
 // ==================================
-// The Combined Agent Methods
+// Agent Methods
 // ==================================
 
-// List returns all public keys from both local ephemeral keys and the YubiKey.
+// List returns all public keys from the YubiKey.
 func (a *Agent) List() ([]*agent.Key, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if a.locked {
-		return nil, errors.New("agent is locked")
-	}
-
 	var out []*agent.Key
 
-	// 1) local ephemeral
-	for _, sk := range a.localKeys {
-		signer, err := ssh.NewSignerFromKey(sk.privateKey)
+	if err := a.ensureYK(); err != nil {
+		return nil, err
+	}
+
+	for _, slot := range enabledSlots {
+		pk, err := getPublicKey(a.yk.Device, slot)
 		if err != nil {
 			continue
 		}
-		pub := signer.PublicKey()
-		if sk.certificate != nil {
-			pub = sk.certificate
-		}
+		comment := fmt.Sprintf("%s #%d PIV Slot %x", a.yk.Name, a.yk.Serial, slot.Key)
 		out = append(out, &agent.Key{
-			Format:  pub.Type(),
-			Blob:    pub.Marshal(),
-			Comment: sk.comment,
+			Format:  pk.Type(),
+			Blob:    pk.Marshal(),
+			Comment: comment,
 		})
-	}
-
-	// 2) YubiKey-based
-	if err := a.ensureYK(); err == nil {
-		for _, slot := range enabledSlots {
-			pk, err := getPublicKey(a.yk.Device, slot)
-			if err != nil {
-				continue
-			}
-			comment := fmt.Sprintf("%s #%d PIV Slot %x", a.yk.Name, a.yk.Serial, slot.Key)
-			out = append(out, &agent.Key{
-				Format:  pk.Type(),
-				Blob:    pk.Marshal(),
-				Comment: comment,
-			})
-		}
 	}
 
 	return out, nil
@@ -324,40 +329,8 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if a.locked {
-		return nil, errors.New("agent is locked")
-	}
-
 	pubKeyBlob := key.Marshal()
 
-	// 1) Try local ephemeral keys
-	if sk, found := a.localKeys[string(pubKeyBlob)]; found {
-		signer, err := ssh.NewSignerFromKey(sk.privateKey)
-		if err != nil {
-			return nil, err
-		}
-		if sk.certificate != nil {
-			signer, err = ssh.NewCertSigner(sk.certificate, signer)
-			if err != nil {
-				return nil, err
-			}
-		}
-		alg := signer.PublicKey().Type()
-		if alg == ssh.KeyAlgoRSA && (flags&agent.SignatureFlagRsaSha256 != 0) {
-			alg = ssh.SigAlgoRSASHA2256
-		} else if alg == ssh.KeyAlgoRSA && (flags&agent.SignatureFlagRsaSha512 != 0) {
-			alg = ssh.SigAlgoRSASHA2512
-		}
-		if algorithmSigner, ok := signer.(ssh.AlgorithmSigner); ok {
-			sig, err := algorithmSigner.SignWithAlgorithm(rand.Reader, data, alg)
-			return sig, err
-		}
-		// fallback
-		sig, err := signer.Sign(rand.Reader, data)
-		return sig, err
-	}
-
-	// 2) Fallback to YubiKey-based
 	if err := a.ensureYK(); err != nil {
 		return nil, fmt.Errorf("could not reach YubiKey: %w", err)
 	}
@@ -365,14 +338,32 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 	// Start a timer for "touch needed" notifications
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	a.touchMu.Lock()
 	a.touchNotification = time.NewTimer(5 * time.Second)
-	go func() {
-		select {
-		case <-a.touchNotification.C:
-			showNotification("Waiting for YubiKey touch...")
-		case <-ctx.Done():
+	a.touchMu.Unlock()
+
+	defer func() {
+		a.touchMu.Lock()
+		if a.touchNotification != nil {
 			a.touchNotification.Stop()
-			return
+			a.touchNotification = nil
+		}
+		a.touchMu.Unlock()
+	}()
+
+	go func() {
+		a.touchMu.Lock()
+		timer := a.touchNotification
+		a.touchMu.Unlock()
+
+		if timer != nil {
+			select {
+			case <-timer.C:
+				showNotification("Waiting for YubiKey touch...")
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 
@@ -413,36 +404,16 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 	}
 }
 
-// Signers returns a slice of signers (local ephemeral + YubiKey)
+// Signers returns a slice of signers from the YubiKey
 func (a *Agent) Signers() ([]ssh.Signer, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if a.locked {
-		return nil, errors.New("agent is locked")
+	if err := a.ensureYK(); err != nil {
+		return nil, err
 	}
 
-	var out []ssh.Signer
-
-	// local ephemeral
-	for _, sk := range a.localKeys {
-		s, err := ssh.NewSignerFromKey(sk.privateKey)
-		if err == nil {
-			if sk.certificate != nil {
-				s, _ = ssh.NewCertSigner(sk.certificate, s)
-			}
-			out = append(out, s)
-		}
-	}
-
-	// YubiKey
-	if err := a.ensureYK(); err == nil {
-		ykSigners, err := a.signersYubi()
-		if err == nil {
-			out = append(out, ykSigners...)
-		}
-	}
-	return out, nil
+	return a.signersYubi()
 }
 
 // showNotification is used to show a desktop notification after waiting 5s for YubiKey touch.
@@ -458,95 +429,27 @@ func showNotification(message string) {
 	}
 }
 
-// Extension is unimplemented; you can implement or leave as-is.
-func (a *Agent) Extension(extensionType string, contents []byte) ([]byte, error) {
-	return nil, agent.ErrExtensionUnsupported
+// Add returns an error as we only support YubiKey keys.
+func (a *Agent) Add(key agent.AddedKey) error {
+	return fmt.Errorf("yubikey-agent: adding keys is not supported, only YubiKey keys are available")
 }
 
-// ======================
-// Local Key Mgmt Methods
-// ======================
-
-// Add adds a new local ephemeral key to memory (e.g. from `ssh-add`).
-func (a *Agent) Add(k agent.AddedKey) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.locked {
-		return errors.New("agent is locked")
-	}
-
-	signer, err := ssh.NewSignerFromKey(k.PrivateKey)
-	if err != nil {
-		return fmt.Errorf("failed to create signer: %v", err)
-	}
-	pubBlob := signer.PublicKey().Marshal()
-
-	var cert *ssh.Certificate
-	if k.Certificate != nil {
-		cert = k.Certificate
-	}
-
-	a.localKeys[string(pubBlob)] = &storedKey{
-		privateKey:       k.PrivateKey,
-		certificate:      cert,
-		comment:          k.Comment,
-		lifetimeSecs:     k.LifetimeSecs,
-		confirmBeforeUse: k.ConfirmBeforeUse,
-	}
-	return nil
-}
-
-// Remove removes a local ephemeral key from memory by its public key blob.
+// Remove returns an error as we only support YubiKey keys.
 func (a *Agent) Remove(key ssh.PublicKey) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.locked {
-		return errors.New("agent is locked")
-	}
-	pubBlob := key.Marshal()
-	delete(a.localKeys, string(pubBlob))
-	return nil
+	return fmt.Errorf("yubikey-agent: removing keys is not supported, only YubiKey keys are available")
 }
 
-// RemoveAll removes all local ephemeral keys (but not hardware keys).
+// RemoveAll returns success as there are no keys to remove (YubiKey keys cannot be removed).
 func (a *Agent) RemoveAll() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.locked {
-		return errors.New("agent is locked")
-	}
-	a.localKeys = make(map[string]*storedKey)
 	return nil
 }
 
-// Lock locks the agent so no operations can be done until unlocked.
+// Lock returns an error as locking is not supported for YubiKey-only agent.
 func (a *Agent) Lock(passphrase []byte) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if a.locked {
-		return errors.New("agent is already locked")
-	}
-	a.locked = true
-	a.lockPassphrase = append([]byte(nil), passphrase...) // store copy
-	return nil
+	return fmt.Errorf("yubikey-agent: locking is not supported")
 }
 
-// Unlock unlocks the agent, allowing operations again.
+// Unlock returns an error as locking is not supported for YubiKey-only agent.
 func (a *Agent) Unlock(passphrase []byte) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
-	if !a.locked {
-		return errors.New("agent is not locked")
-	}
-	if !bytes.Equal(passphrase, a.lockPassphrase) {
-		return errors.New("incorrect passphrase")
-	}
-	a.locked = false
-	a.lockPassphrase = nil
-	return nil
+	return fmt.Errorf("yubikey-agent: locking is not supported")
 }
