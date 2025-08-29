@@ -26,6 +26,29 @@ import (
 	"golang.org/x/term"
 )
 
+const (
+	// RequiredPINLength is the required length for YubiKey PINs
+	RequiredPINLength = 8
+
+	// CertificateValidityYears is how many years certificates are valid for
+	CertificateValidityYears = 42
+)
+
+// slotConfig defines the configuration for a PIV slot
+type slotConfig struct {
+	slot        piv.Slot
+	pinPolicy   piv.PINPolicy
+	touchPolicy piv.TouchPolicy
+}
+
+// defaultSlotConfigs are the default configurations for PIV slots
+var defaultSlotConfigs = []slotConfig{
+	{piv.SlotAuthentication, piv.PINPolicyOnce, piv.TouchPolicyAlways},
+	{piv.SlotSignature, piv.PINPolicyAlways, piv.TouchPolicyAlways},
+	{piv.SlotCardAuthentication, piv.PINPolicyOnce, piv.TouchPolicyNever},
+	{piv.SlotKeyManagement, piv.PINPolicyNever, piv.TouchPolicyNever},
+}
+
 var Version string
 
 // getSingleYubiKey loads YubiKeys (respecting --serial) and ensures exactly one is found.
@@ -70,8 +93,8 @@ func RunSetup(yk *piv.YubiKey) {
 	if err != nil {
 		log.Fatalln("Failed to read PIN:", err)
 	}
-	if len(pin) == 0 || len(pin) != 8 {
-		log.Fatalln("The PIN needs to be 8 characters.")
+	if len(pin) == 0 || len(pin) != RequiredPINLength {
+		log.Fatalf("The PIN needs to be %d characters.\n", RequiredPINLength)
 	}
 	fmt.Print("Repeat PIN/PUK: ")
 	repeat, err := term.ReadPassword(int(os.Stdin.Fd()))
@@ -132,25 +155,11 @@ func RunSetup(yk *piv.YubiKey) {
 		log.Fatalln("use --really-delete-all-piv-keys ⚠️")
 	}
 
-	// Now generate our four keys (slots 9a, 9c, 9e, 9d)
-	err = generateAndStoreSSHKey(yk, key, piv.SlotAuthentication, piv.PINPolicyOnce, piv.TouchPolicyAlways)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = generateAndStoreSSHKey(yk, key, piv.SlotSignature, piv.PINPolicyAlways, piv.TouchPolicyAlways)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = generateAndStoreSSHKey(yk, key, piv.SlotCardAuthentication, piv.PINPolicyOnce, piv.TouchPolicyNever)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = generateAndStoreSSHKey(yk, key, piv.SlotKeyManagement, piv.PINPolicyNever, piv.TouchPolicyNever)
-	if err != nil {
-		log.Fatal(err)
+	// Generate keys for all configured slots
+	for _, cfg := range defaultSlotConfigs {
+		if err := generateAndStoreSSHKey(yk, key, cfg.slot, cfg.pinPolicy, cfg.touchPolicy); err != nil {
+			log.Fatalf("Failed to configure slot %x: %v", cfg.slot.Key, err)
+		}
 	}
 
 	fmt.Println("")
@@ -201,7 +210,7 @@ func generateAndStoreSSHKey(yk *piv.YubiKey, key []byte, slot piv.Slot, policy p
 		Subject: pkix.Name{
 			CommonName: "SSH key",
 		},
-		NotAfter:     time.Now().AddDate(42, 0, 0), // arbitrary far future
+		NotAfter:     time.Now().AddDate(CertificateValidityYears, 0, 0),
 		NotBefore:    time.Now(),
 		SerialNumber: randomSerialNumber(),
 		KeyUsage:     x509.KeyUsageKeyAgreement | x509.KeyUsageDigitalSignature,
@@ -259,8 +268,8 @@ func SetupSlot(yk *piv.YubiKey, slot piv.Slot, pinPolicy piv.PINPolicy, touchPol
 		if err != nil {
 			log.Fatalln("Failed to read PIN:", err)
 		}
-		if len(pin) == 0 || len(pin) != 8 {
-			log.Fatalln("The PIN needs to be 8 characters.")
+		if len(pin) == 0 || len(pin) != RequiredPINLength {
+			log.Fatalf("The PIN needs to be %d characters.\n", RequiredPINLength)
 		}
 		fmt.Print("Repeat PIN/PUK: ")
 		repeat, err := term.ReadPassword(int(os.Stdin.Fd()))

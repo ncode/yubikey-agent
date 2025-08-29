@@ -5,6 +5,7 @@
 // license that can be found in the LICENSE file or at
 // https://developers.google.com/open-source/licenses/bsd
 
+// Package agent implements an SSH agent that uses YubiKey PIV tokens for key operations.
 package agent
 
 import (
@@ -33,6 +34,17 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/term"
+)
+
+const (
+	// TouchNotificationTimeout is how long to wait before showing a touch notification
+	TouchNotificationTimeout = 5 * time.Second
+
+	// TemporaryErrorRetryDelay is how long to wait before retrying after a temporary error
+	TemporaryErrorRetryDelay = time.Second
+
+	// SocketDirPermissions is the permission mode for the socket directory
+	SocketDirPermissions = 0700
 )
 
 var enabledSlots = []piv.Slot{
@@ -74,7 +86,11 @@ func LoadYubiKeys() ([]*Yubi, error) {
 			// Could not open this card; skip
 			continue
 		}
-		sn, _ := device.Serial()
+		sn, err := device.Serial()
+		if err != nil {
+			// Log warning but continue with serial 0
+			log.Printf("Warning: failed to get serial for %s: %v", card, err)
+		}
 
 		// If a serial is provided and this doesn't match, skip this device entirely.
 		if serial != 0 && sn != serial {
@@ -117,7 +133,7 @@ func Run() {
 
 	a := &Agent{}
 
-	c := make(chan os.Signal)
+	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGHUP)
 	go func() {
 		for range c {
@@ -125,8 +141,10 @@ func Run() {
 		}
 	}()
 
-	os.Remove(socket)
-	if err := os.MkdirAll(filepath.Dir(socket), 0777); err != nil {
+	if err := os.Remove(socket); err != nil && !os.IsNotExist(err) {
+		log.Printf("Warning: failed to remove stale socket: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(socket), SocketDirPermissions); err != nil {
 		log.Fatalln("Failed to create UNIX socket folder:", err)
 	}
 	l, err := net.Listen("unix", socket)
@@ -142,7 +160,7 @@ func Run() {
 			}
 			if terr, ok := err.(temporary); ok && terr.Temporary() {
 				log.Println("Temporary Accept error, sleeping 1s:", err)
-				time.Sleep(1 * time.Second)
+				time.Sleep(TemporaryErrorRetryDelay)
 				continue
 			}
 			log.Fatalln("Failed to accept connections:", err)
@@ -197,7 +215,9 @@ func (a *Agent) ensureYK() error {
 		}
 		// If any device isn't healthy, close and reload them all
 		for _, yk := range a.yks {
-			_ = yk.Device.Close()
+			if err := yk.Device.Close(); err != nil {
+				log.Printf("Warning: failed to close unhealthy YubiKey %s: %v", yk.Name, err)
+			}
 		}
 		a.yks = nil
 		log.Println("Reconnecting to the YubiKeys...")
@@ -216,10 +236,18 @@ func (a *Agent) ensureYK() error {
 func (a *Agent) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+
+	// Stop any pending touch notification
+	if a.touchNotification != nil {
+		a.touchNotification.Stop()
+	}
+
 	if len(a.yks) > 0 {
 		log.Println("Received SIGHUP, dropping YubiKey transaction(s)...")
 		for _, yk := range a.yks {
-			_ = yk.Device.Close()
+			if err := yk.Device.Close(); err != nil {
+				log.Printf("Warning: failed to close YubiKey %s: %v", yk.Name, err)
+			}
 		}
 		a.yks = nil
 	}
@@ -285,9 +313,13 @@ func (a *Agent) Signers() ([]ssh.Signer, error) {
 func (a *Agent) getPINFor(yk *Yubi) func() (string, error) {
 	return func() (string, error) {
 		if a.touchNotification != nil && a.touchNotification.Stop() {
-			defer a.touchNotification.Reset(5 * time.Second)
+			defer a.touchNotification.Reset(TouchNotificationTimeout)
 		}
-		r, _ := yk.Device.Retries()
+		r, err := yk.Device.Retries()
+		if err != nil {
+			log.Printf("Warning: failed to get retries: %v", err)
+			r = 0
+		}
 		return getPIN(yk.Serial, r)
 	}
 }
@@ -322,16 +354,10 @@ func (a *Agent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
 	return a.SignWithFlags(key, data, 0)
 }
 
-func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.ensureYK(); err != nil {
-		return nil, fmt.Errorf("could not reach YubiKeys: %w", err)
-	}
-
+// setupTouchNotification sets up a timer to show a notification if YubiKey touch is needed
+func (a *Agent) setupTouchNotification() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	a.touchNotification = time.NewTimer(5 * time.Second)
+	a.touchNotification = time.NewTimer(TouchNotificationTimeout)
 	go func() {
 		select {
 		case <-a.touchNotification.C:
@@ -341,38 +367,67 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 		}
 		showNotification("Waiting for YubiKey touch...")
 	}()
+	return ctx, cancel
+}
+
+// determineSignatureAlgorithm determines the signature algorithm based on key type and flags
+func determineSignatureAlgorithm(key ssh.PublicKey, flags agent.SignatureFlags) string {
+	alg := key.Type()
+	switch {
+	case alg == ssh.KeyAlgoRSA && (flags&agent.SignatureFlagRsaSha256 != 0):
+		return ssh.SigAlgoRSASHA2256
+	case alg == ssh.KeyAlgoRSA && (flags&agent.SignatureFlagRsaSha512 != 0):
+		return ssh.SigAlgoRSASHA2512
+	default:
+		return alg
+	}
+}
+
+// performSignature attempts to sign data with the matching signer
+func (a *Agent) performSignature(signers []ssh.Signer, key ssh.PublicKey, data []byte, alg string) (*ssh.Signature, error) {
+	keyBlob := key.Marshal()
+	for _, s := range signers {
+		if !bytes.Equal(s.PublicKey().Marshal(), keyBlob) {
+			continue
+		}
+
+		sg, err := s.(ssh.AlgorithmSigner).SignWithAlgorithm(rand.Reader, data, alg)
+		if err != nil {
+			// If the PIN prompt indicated we still have retries left, try again
+			if strings.Contains(err.Error(), "remaining") {
+				return nil, err // Let caller retry
+			}
+			return nil, err
+		}
+		return sg, nil
+	}
+	return nil, fmt.Errorf("no private keys match the requested public key")
+}
+
+func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err := a.ensureYK(); err != nil {
+		return nil, fmt.Errorf("could not reach YubiKeys: %w", err)
+	}
+
+	_, cancel := a.setupTouchNotification()
+	defer cancel()
+
+	alg := determineSignatureAlgorithm(key, flags)
 
 	for {
 		signers, err := a.signers()
 		if err != nil {
 			return nil, err
 		}
-		for _, s := range signers {
-			if !bytes.Equal(s.PublicKey().Marshal(), key.Marshal()) {
-				continue
-			}
 
-			alg := key.Type()
-			switch {
-			case alg == ssh.KeyAlgoRSA && (flags&agent.SignatureFlagRsaSha256 != 0):
-				alg = ssh.SigAlgoRSASHA2256
-			case alg == ssh.KeyAlgoRSA && (flags&agent.SignatureFlagRsaSha512 != 0):
-				alg = ssh.SigAlgoRSASHA2512
-			}
-
-			sg, err := s.(ssh.AlgorithmSigner).SignWithAlgorithm(rand.Reader, data, alg)
-			if err != nil {
-				// If the PIN prompt indicated we still have retries left, try again
-				if strings.Contains(err.Error(), "remaining") {
-					continue
-				}
-				return nil, err
-			}
-			return sg, nil
-
+		sig, err := a.performSignature(signers, key, data, alg)
+		if err != nil && strings.Contains(err.Error(), "remaining") {
+			// Retry if PIN failed but we have retries left
+			continue
 		}
-		// If we found no matching private key, return an error.
-		return nil, fmt.Errorf("no private keys match the requested public key")
+		return sig, err
 	}
 }
 
