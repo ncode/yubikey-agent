@@ -52,6 +52,33 @@ var defaultSlotConfigs = []slotConfig{
 // Version contains the build version of yubikey-agent, set at build time.
 var Version string
 
+// readPINWithConfirmation prompts the user to enter a PIN and confirm it.
+// This is an interactive function that exits on error using log.Fatal.
+func readPINWithConfirmation() []byte {
+	fmt.Println("🔐 The PIN is up to 8 numbers, letters, or symbols. Not just numbers!")
+	fmt.Println("❌ The key will be lost if the PIN and PUK are locked after 3 incorrect tries.")
+	fmt.Println("")
+	fmt.Print("Choose a new PIN/PUK: ")
+	pin, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Print("\n")
+	if err != nil {
+		log.Fatalln("Failed to read PIN:", err)
+	}
+	if len(pin) == 0 || len(pin) != RequiredPINLength {
+		log.Fatalf("The PIN needs to be %d characters.\n", RequiredPINLength)
+	}
+	fmt.Print("Repeat PIN/PUK: ")
+	repeat, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Print("\n")
+	if err != nil {
+		log.Fatalln("Failed to read PIN:", err)
+	}
+	if !bytes.Equal(repeat, pin) {
+		log.Fatalln("PINs don't match!")
+	}
+	return pin
+}
+
 // getSingleYubiKey loads YubiKeys (respecting --serial) and ensures exactly one is found.
 // Returns the YubiKey and nil if successful, or nil and an error if failed.
 func GetSingleYubiKey() (*Yubi, error) {
@@ -85,26 +112,7 @@ func RunSetup(yk *piv.YubiKey) {
 		log.Fatalln("Failed to access authentication slot:", err)
 	}
 
-	fmt.Println("🔐 The PIN is up to 8 numbers, letters, or symbols. Not just numbers!")
-	fmt.Println("❌ The key will be lost if the PIN and PUK are locked after 3 incorrect tries.")
-	fmt.Println("")
-	fmt.Print("Choose a new PIN/PUK: ")
-	pin, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Print("\n")
-	if err != nil {
-		log.Fatalln("Failed to read PIN:", err)
-	}
-	if len(pin) == 0 || len(pin) != RequiredPINLength {
-		log.Fatalf("The PIN needs to be %d characters.\n", RequiredPINLength)
-	}
-	fmt.Print("Repeat PIN/PUK: ")
-	repeat, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Print("\n")
-	if err != nil {
-		log.Fatalln("Failed to read PIN:", err)
-	} else if !bytes.Equal(repeat, pin) {
-		log.Fatalln("PINs don't match!")
-	}
+	pin := readPINWithConfirmation()
 
 	fmt.Println("")
 	fmt.Println("🧪 Reticulating splines...")
@@ -173,13 +181,13 @@ func RunSetup(yk *piv.YubiKey) {
 	fmt.Println("💭 Remember: everything breaks, have a backup plan for when this YubiKey does.")
 }
 
-func randomSerialNumber() *big.Int {
+func randomSerialNumber() (*big.Int, error) {
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
 	if err != nil {
-		log.Fatalln("Failed to generate serial number:", err)
+		return nil, fmt.Errorf("failed to generate serial number: %w", err)
 	}
-	return serialNumber
+	return serialNumber, nil
 }
 
 // generateAndStoreSSHKey generates a new EC key on the given slot (with the
@@ -207,13 +215,17 @@ func generateAndStoreSSHKey(yk *piv.YubiKey, key []byte, slot piv.Slot, policy p
 		},
 		PublicKey: priv.Public(),
 	}
+	serial, err := randomSerialNumber()
+	if err != nil {
+		return err
+	}
 	template := &x509.Certificate{
 		Subject: pkix.Name{
 			CommonName: "SSH key",
 		},
 		NotAfter:     time.Now().AddDate(CertificateValidityYears, 0, 0),
 		NotBefore:    time.Now(),
-		SerialNumber: randomSerialNumber(),
+		SerialNumber: serial,
 		KeyUsage:     x509.KeyUsageKeyAgreement | x509.KeyUsageDigitalSignature,
 	}
 	certBytes, err := x509.CreateCertificate(rand.Reader, template, parent, pub, priv)
@@ -260,26 +272,7 @@ func SetupSlot(yk *piv.YubiKey, slot piv.Slot, pinPolicy piv.PINPolicy, touchPol
 		// Need to set up the management key, PIN, and PUK from defaults
 		fmt.Println("🔐 No management key found in metadata. Need to set up YubiKey first.")
 		fmt.Println("")
-		fmt.Println("🔐 The PIN is up to 8 numbers, letters, or symbols. Not just numbers!")
-		fmt.Println("❌ The key will be lost if the PIN and PUK are locked after 3 incorrect tries.")
-		fmt.Println("")
-		fmt.Print("Choose a new PIN/PUK: ")
-		pin, err := term.ReadPassword(int(os.Stdin.Fd()))
-		fmt.Print("\n")
-		if err != nil {
-			log.Fatalln("Failed to read PIN:", err)
-		}
-		if len(pin) == 0 || len(pin) != RequiredPINLength {
-			log.Fatalf("The PIN needs to be %d characters.\n", RequiredPINLength)
-		}
-		fmt.Print("Repeat PIN/PUK: ")
-		repeat, err := term.ReadPassword(int(os.Stdin.Fd()))
-		fmt.Print("\n")
-		if err != nil {
-			log.Fatalln("Failed to read PIN:", err)
-		} else if !bytes.Equal(repeat, pin) {
-			log.Fatalln("PINs don't match!")
-		}
+		pin := readPINWithConfirmation()
 
 		fmt.Println("")
 		fmt.Println("🧪 Setting up management key and PIN...")

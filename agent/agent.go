@@ -201,7 +201,7 @@ func Run() {
 // Agent holds status of the current agent in use and
 // all yubikeys associated with it
 type Agent struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	// Instead of a single YubiKey, store all discovered YubiKeys:
 	yks []*Yubi
