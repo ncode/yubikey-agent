@@ -8,6 +8,7 @@ package cmd
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"runtime/debug"
 
@@ -41,17 +42,19 @@ func Execute() {
 	}
 }
 
+var homeDir string
+
 func init() {
 	cobra.OnInitialize(initConfig)
-	home, err := homedir.Dir()
+	var err error
+	homeDir, err = homedir.Dir()
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		log.Fatalf("Failed to determine home directory: %v", err)
 	}
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.yubikey-agent.yaml)")
 	rootCmd.PersistentFlags().Uint32P("serial", "s", 0, "serial of the device you would like to use")
 	viper.BindPFlag("serial", rootCmd.PersistentFlags().Lookup("serial"))
-	rootCmd.PersistentFlags().StringP("listen", "l", fmt.Sprintf("%s/.ssh/yubikey-agent.sock", home), "Run the agent, listening on the UNIX socket at PATH (default is $HOME/.ssh.yubikey-agent.sock)")
+	rootCmd.PersistentFlags().StringP("listen", "l", fmt.Sprintf("%s/.ssh/yubikey-agent.sock", homeDir), "Run the agent, listening on the UNIX socket at PATH (default is $HOME/.ssh.yubikey-agent.sock)")
 	viper.BindPFlag("listen", rootCmd.PersistentFlags().Lookup("listen"))
 
 	if Version != "" {
@@ -70,26 +73,13 @@ func initConfig() {
 		// Use config file from the flag.
 		viper.SetConfigFile(cfgFile)
 	} else {
-		// Find home directory.
-		home, err := homedir.Dir()
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-		}
-
 		// Search config in home directory with name ".yubikey-agent" (without extension).
-		viper.AddConfigPath(home)
+		viper.AddConfigPath(homeDir)
 		viper.SetConfigName(".yubikey-agent")
 	}
 
 	viper.AutomaticEnv() // read in environment variables that match
 
-	// If a config file is found, read it in.
-	if err := viper.ReadInConfig(); err == nil {
-		fmt.Println("Using config file:", viper.ConfigFileUsed())
-	}
-
-	if viper.GetUint32("serial") != 0 {
-		fmt.Println("Using serial:", viper.GetUint32("serial"))
-	}
+	// If a config file is found, read it in silently
+	viper.ReadInConfig()
 }

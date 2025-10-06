@@ -8,7 +8,6 @@ package cmd
 
 import (
 	"fmt"
-	"log"
 
 	"github.com/ncode/yubikey-agent/agent"
 	"github.com/spf13/cobra"
@@ -18,14 +17,15 @@ import (
 var listCmd = &cobra.Command{
 	Use:   "list",
 	Short: "list available YubiKey devices connected",
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		yubikeys, err := agent.LoadYubiKeys()
 		if err != nil {
-			log.Fatalln(err)
+			return err
 		}
 		for _, yubi := range yubikeys {
 			fmt.Printf("🔐 %s #%d\n", yubi.Name, yubi.Serial)
 		}
+		return nil
 	},
 }
 

@@ -7,9 +7,6 @@
 package cmd
 
 import (
-	"fmt"
-	"os"
-
 	"github.com/ncode/yubikey-agent/agent"
 	"github.com/spf13/cobra"
 )
@@ -18,18 +15,17 @@ import (
 var unblockCmd = &cobra.Command{
 	Use:   "unblock",
 	Short: "unblocks the specified YubiKey",
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		yk, err := agent.GetSingleYubiKey()
 		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
+			return err
 		}
 
 		err = agent.UnblockPIN(yk.Device)
 		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
+			return err
 		}
+		return nil
 	},
 }
 

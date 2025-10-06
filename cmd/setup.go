@@ -8,7 +8,6 @@ package cmd
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/ncode/yubikey-agent/agent"
 
@@ -16,31 +15,28 @@ import (
 )
 
 var reallyDeleteAllPivKeys bool
-var serial int
 
 // setupCmd represents the setup command
 var setupCmd = &cobra.Command{
 	Use:   "setup",
 	Short: "setup the specified YubiKey",
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		yk, err := agent.GetSingleYubiKey()
 		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
+			return err
 		}
 		if reallyDeleteAllPivKeys {
 			fmt.Println("Resetting YubiKey PIV applet...")
 			if err := yk.Device.Reset(); err != nil {
-				fmt.Println(err)
-				os.Exit(1)
+				return fmt.Errorf("failed to reset YubiKey: %w", err)
 			}
 		}
 		agent.RunSetup(yk.Device)
+		return nil
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(setupCmd)
 	setupCmd.PersistentFlags().BoolVar(&reallyDeleteAllPivKeys, "really-delete-all-piv-keys", false, "wipe all current keys on your device")
-	setupCmd.PersistentFlags().IntVar(&serial, "serial", 0, "define the yubikey to be used")
 }
