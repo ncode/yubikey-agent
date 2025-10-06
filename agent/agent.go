@@ -77,32 +77,18 @@ func LoadYubiKeys() ([]*Yubi, error) {
 	var yubikeys []*Yubi
 
 	for _, card := range cards {
-		// Only consider Yubico cards
-		if !strings.HasPrefix(strings.ToLower(card), "yubico") {
+		yk, err := tryOpenYubiKey(card, serial)
+		if err != nil {
+			// Log and skip this card
+			log.Printf("Skipping card %s: %v", card, err)
 			continue
 		}
-		device, err := piv.Open(card)
-		if err != nil {
-			// Could not open this card; skip
-			continue
-		}
-		sn, err := device.Serial()
-		if err != nil {
-			// Log warning but continue with serial 0
-			log.Printf("Warning: failed to get serial for %s: %v", card, err)
-		}
-
-		// If a serial is provided and this doesn't match, skip this device entirely.
-		if serial != 0 && sn != serial {
-			device.Close()
+		if yk == nil {
+			// This card was filtered out (wrong serial), already closed
 			continue
 		}
 
-		yubikeys = append(yubikeys, &Yubi{
-			Name:   card,
-			Serial: sn,
-			Device: device,
-		})
+		yubikeys = append(yubikeys, yk)
 
 		// If we were looking for a specific serial, we can stop early after finding it.
 		if serial != 0 {
@@ -118,6 +104,49 @@ func LoadYubiKeys() ([]*Yubi, error) {
 		return nil, errors.New("unable to connect to any YubiKey device")
 	}
 	return yubikeys, nil
+}
+
+// tryOpenYubiKey attempts to open and validate a single YubiKey card.
+// Returns nil, nil if the card should be skipped (e.g., wrong serial).
+// Returns nil, error if there was an error opening the card.
+// Returns *Yubi, nil if the card was successfully opened and validated.
+func tryOpenYubiKey(card string, filterSerial uint32) (*Yubi, error) {
+	// Only consider Yubico cards
+	if !strings.HasPrefix(strings.ToLower(card), "yubico") {
+		return nil, nil
+	}
+
+	device, err := piv.Open(card)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open: %w", err)
+	}
+
+	// Ensure device is closed if we don't return it successfully
+	var yk *Yubi
+	defer func() {
+		if yk == nil {
+			device.Close()
+		}
+	}()
+
+	sn, err := device.Serial()
+	if err != nil {
+		// Log warning but continue with serial 0
+		log.Printf("Warning: failed to get serial for %s: %v", card, err)
+		sn = 0
+	}
+
+	// If a serial is provided and this doesn't match, filter it out
+	if filterSerial != 0 && sn != filterSerial {
+		return nil, nil
+	}
+
+	yk = &Yubi{
+		Name:   card,
+		Serial: sn,
+		Device: device,
+	}
+	return yk, nil
 }
 
 // Run executes the agent using the specified socket path
@@ -191,10 +220,11 @@ func (a *Agent) serveConn(c net.Conn) {
 	}
 }
 
-func healthy(yk *piv.YubiKey) bool {
-	// We can't use Serial because it locks the session on older firmwares, and
-	// can't use Retries because it fails when the session is unlocked.
-	_, err := yk.AttestationCertificate()
+// healthy checks if the YubiKey connection is still functional.
+// We can't use Serial because it locks the session on older firmwares, and
+// can't use Retries because it fails when the session is unlocked.
+func (y *Yubi) healthy() bool {
+	_, err := y.Device.AttestationCertificate()
 	return err == nil
 }
 
@@ -205,7 +235,7 @@ func (a *Agent) ensureYK() error {
 	if len(a.yks) > 0 {
 		allHealthy := true
 		for _, yk := range a.yks {
-			if !healthy(yk.Device) {
+			if !yk.healthy() {
 				allHealthy = false
 				break
 			}
@@ -370,8 +400,8 @@ func (a *Agent) setupTouchNotification() (context.Context, context.CancelFunc) {
 	return ctx, cancel
 }
 
-// determineSignatureAlgorithm determines the signature algorithm based on key type and flags
-func determineSignatureAlgorithm(key ssh.PublicKey, flags agent.SignatureFlags) string {
+// signatureAlgorithm determines the signature algorithm based on key type and flags
+func signatureAlgorithm(key ssh.PublicKey, flags agent.SignatureFlags) string {
 	alg := key.Type()
 	switch {
 	case alg == ssh.KeyAlgoRSA && (flags&agent.SignatureFlagRsaSha256 != 0):
@@ -414,7 +444,7 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 	_, cancel := a.setupTouchNotification()
 	defer cancel()
 
-	alg := determineSignatureAlgorithm(key, flags)
+	alg := signatureAlgorithm(key, flags)
 
 	for {
 		signers, err := a.signers()

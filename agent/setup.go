@@ -49,6 +49,7 @@ var defaultSlotConfigs = []slotConfig{
 	{piv.SlotKeyManagement, piv.PINPolicyNever, piv.TouchPolicyNever},
 }
 
+// Version contains the build version of yubikey-agent, set at build time.
 var Version string
 
 // getSingleYubiKey loads YubiKeys (respecting --serial) and ensures exactly one is found.

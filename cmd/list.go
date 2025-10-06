@@ -11,7 +11,10 @@ import (
 
 	"github.com/ncode/yubikey-agent/agent"
 	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
+
+var plainOutput bool
 
 // listCmd represents the list command
 var listCmd = &cobra.Command{
@@ -23,7 +26,11 @@ var listCmd = &cobra.Command{
 			return err
 		}
 		for _, yubi := range yubikeys {
-			fmt.Printf("🔐 %s #%d\n", yubi.Name, yubi.Serial)
+			if viper.GetBool("plain") {
+				fmt.Printf("%s #%d\n", yubi.Name, yubi.Serial)
+			} else {
+				fmt.Printf("🔐 %s #%d\n", yubi.Name, yubi.Serial)
+			}
 		}
 		return nil
 	},
@@ -31,4 +38,6 @@ var listCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(listCmd)
+	listCmd.Flags().BoolVar(&plainOutput, "plain", false, "use plain text output without emojis")
+	viper.BindPFlag("plain", listCmd.Flags().Lookup("plain"))
 }
