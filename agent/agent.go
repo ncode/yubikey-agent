@@ -45,6 +45,10 @@ const (
 
 	// SocketDirPermissions is the permission mode for the socket directory
 	SocketDirPermissions = 0700
+
+	// SignOperationTimeout is the maximum time allowed for a sign operation
+	// This prevents indefinite blocking waiting for YubiKey touch
+	SignOperationTimeout = 2 * time.Minute
 )
 
 var enabledSlots = []piv.Slot{
@@ -65,6 +69,17 @@ type Yubi struct {
 // only the matching YubiKey will be returned. This ensures we never "touch"
 // any other YubiKeys if `serial` is set.
 func LoadYubiKeys() ([]*Yubi, error) {
+	return LoadYubiKeysContext(context.Background())
+}
+
+// LoadYubiKeysContext loads all connected YubiKeys with context support.
+// If ctx is cancelled during loading, it returns ctx.Err().
+func LoadYubiKeysContext(ctx context.Context) ([]*Yubi, error) {
+	// Check context before starting
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	cards, err := piv.Cards()
 	if err != nil {
 		return nil, err
@@ -77,6 +92,15 @@ func LoadYubiKeys() ([]*Yubi, error) {
 	var yubikeys []*Yubi
 
 	for _, card := range cards {
+		// Check context before each card
+		if err := ctx.Err(); err != nil {
+			// Clean up any already-opened devices
+			for _, yk := range yubikeys {
+				yk.Device.Close()
+			}
+			return nil, err
+		}
+
 		yk, err := tryOpenYubiKey(card, serial)
 		if err != nil {
 			// Log and skip this card
@@ -441,23 +465,47 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 		return nil, fmt.Errorf("could not reach YubiKeys: %w", err)
 	}
 
-	_, cancel := a.setupTouchNotification()
+	// Create context with timeout for the entire sign operation
+	ctx, cancel := context.WithTimeout(context.Background(), SignOperationTimeout)
 	defer cancel()
+
+	// Set up touch notification
+	_, cancelTouch := a.setupTouchNotification()
+	defer cancelTouch()
 
 	alg := signatureAlgorithm(key, flags)
 
-	for {
-		signers, err := a.signers()
-		if err != nil {
-			return nil, err
-		}
+	// Channel to receive signature result
+	type result struct {
+		sig *ssh.Signature
+		err error
+	}
+	resultCh := make(chan result, 1)
 
-		sig, err := a.performSignature(signers, key, data, alg)
-		if err != nil && strings.Contains(err.Error(), "remaining") {
-			// Retry if PIN failed but we have retries left
-			continue
+	go func() {
+		for {
+			signers, err := a.signers()
+			if err != nil {
+				resultCh <- result{nil, err}
+				return
+			}
+
+			sig, err := a.performSignature(signers, key, data, alg)
+			if err != nil && strings.Contains(err.Error(), "remaining") {
+				// Retry if PIN failed but we have retries left
+				continue
+			}
+			resultCh <- result{sig, err}
+			return
 		}
-		return sig, err
+	}()
+
+	// Wait for either result or timeout
+	select {
+	case res := <-resultCh:
+		return res.sig, res.err
+	case <-ctx.Done():
+		return nil, fmt.Errorf("sign operation timed out after %v (touch required?): %w", SignOperationTimeout, ctx.Err())
 	}
 }
 

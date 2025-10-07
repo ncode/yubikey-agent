@@ -9,6 +9,7 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -79,10 +80,15 @@ func readPINWithConfirmation() []byte {
 	return pin
 }
 
-// getSingleYubiKey loads YubiKeys (respecting --serial) and ensures exactly one is found.
+// GetSingleYubiKey loads YubiKeys (respecting --serial) and ensures exactly one is found.
 // Returns the YubiKey and nil if successful, or nil and an error if failed.
 func GetSingleYubiKey() (*Yubi, error) {
-	yks, err := LoadYubiKeys()
+	return GetSingleYubiKeyContext(context.Background())
+}
+
+// GetSingleYubiKeyContext loads YubiKeys with context support and ensures exactly one is found.
+func GetSingleYubiKeyContext(ctx context.Context) (*Yubi, error) {
+	yks, err := LoadYubiKeysContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load YubiKeys: %w", err)
 	}
