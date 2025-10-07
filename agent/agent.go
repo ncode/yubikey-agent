@@ -51,11 +51,13 @@ const (
 	SignOperationTimeout = 2 * time.Minute
 )
 
+// enabledSlots lists all PIV slots that yubikey-agent will use for SSH keys.
+// These slots are configured during setup with different PIN and touch policies.
 var enabledSlots = []piv.Slot{
-	piv.SlotAuthentication,
-	piv.SlotSignature,
-	piv.SlotKeyManagement,
-	piv.SlotCardAuthentication,
+	piv.SlotAuthentication,     // 9a - PIN once, touch always
+	piv.SlotSignature,          // 9c - PIN always, touch always
+	piv.SlotKeyManagement,      // 9d - PIN once, touch never
+	piv.SlotCardAuthentication, // 9e - PIN never, touch never
 }
 
 // Yubi contains all the information about a YubiKey
@@ -334,6 +336,7 @@ func (a *Agent) List() ([]*agent.Key, error) {
 	return keys, nil
 }
 
+// getPublicKey retrieves the SSH public key from a specific PIV slot.
 func getPublicKey(yk *piv.YubiKey, slot piv.Slot) (ssh.PublicKey, error) {
 	cert, err := yk.Certificate(slot)
 	if err != nil {
@@ -352,7 +355,8 @@ func getPublicKey(yk *piv.YubiKey, slot piv.Slot) (ssh.PublicKey, error) {
 	return pk, nil
 }
 
-// Signers returns signers for all available keys on all YubiKeys.
+// Signers implements the agent.ExtendedAgent interface, returning signers for all keys.
+// This method locks the agent and ensures YubiKey connections are healthy.
 func (a *Agent) Signers() ([]ssh.Signer, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -404,6 +408,8 @@ func (a *Agent) signers() ([]ssh.Signer, error) {
 	return signers, nil
 }
 
+// Sign implements the agent.Agent interface for signing data with a key.
+// This method delegates to SignWithFlags with no flags set.
 func (a *Agent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
 	return a.SignWithFlags(key, data, 0)
 }
@@ -458,6 +464,8 @@ func (a *Agent) performSignature(signers []ssh.Signer, key ssh.PublicKey, data [
 	return nil, fmt.Errorf("no private keys match the requested public key")
 }
 
+// SignWithFlags implements the agent.ExtendedAgent interface for signing with algorithm selection.
+// This operation has a 2-minute timeout to prevent indefinite blocking on YubiKey touch.
 func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -509,6 +517,7 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 	}
 }
 
+// showNotification displays a system notification on macOS and Linux.
 func showNotification(message string) {
 	switch runtime.GOOS {
 	case "darwin":
@@ -521,24 +530,36 @@ func showNotification(message string) {
 	}
 }
 
+// Extension implements the agent.ExtendedAgent interface but no extensions are supported.
 func (a *Agent) Extension(extensionType string, contents []byte) ([]byte, error) {
 	return nil, agent.ErrExtensionUnsupported
 }
 
+// ErrOperationUnsupported is returned for agent operations not supported by yubikey-agent.
+// Since keys are hardware-bound, operations like Add/Remove don't apply.
 var ErrOperationUnsupported = errors.New("operation unsupported")
 
+// Add is not supported as keys cannot be added to hardware tokens remotely.
 func (a *Agent) Add(key agent.AddedKey) error {
 	return ErrOperationUnsupported
 }
+
+// Remove is not supported as keys cannot be removed from hardware tokens remotely.
 func (a *Agent) Remove(key ssh.PublicKey) error {
 	return ErrOperationUnsupported
 }
+
+// RemoveAll is not supported as keys cannot be removed from hardware tokens remotely.
 func (a *Agent) RemoveAll() error {
 	return ErrOperationUnsupported
 }
+
+// Lock is not supported as the YubiKey itself handles PIN-based locking.
 func (a *Agent) Lock(passphrase []byte) error {
 	return ErrOperationUnsupported
 }
+
+// Unlock is not supported as the YubiKey itself handles PIN-based unlocking.
 func (a *Agent) Unlock(passphrase []byte) error {
 	return ErrOperationUnsupported
 }
