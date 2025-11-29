@@ -9,6 +9,7 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -16,7 +17,6 @@ import (
 	"crypto/x509/pkix"
 	"errors"
 	"fmt"
-	"log"
 	"math/big"
 	"os"
 	"time"
@@ -49,12 +49,57 @@ var defaultSlotConfigs = []slotConfig{
 	{piv.SlotKeyManagement, piv.PINPolicyNever, piv.TouchPolicyNever},
 }
 
+// Version contains the build version of yubikey-agent, set at build time.
 var Version string
 
-// getSingleYubiKey loads YubiKeys (respecting --serial) and ensures exactly one is found.
+// ErrPINMismatch is returned when the PIN confirmation doesn't match.
+var ErrPINMismatch = errors.New("PINs don't match")
+
+// ErrInvalidPINLength is returned when the PIN length is incorrect.
+type ErrInvalidPINLength struct {
+	Required int
+	Got      int
+}
+
+func (e ErrInvalidPINLength) Error() string {
+	return fmt.Sprintf("PIN needs to be %d characters, got %d", e.Required, e.Got)
+}
+
+// readPINWithConfirmation prompts the user to enter a PIN and confirm it.
+func readPINWithConfirmation() ([]byte, error) {
+	fmt.Println("🔐 The PIN is up to 8 numbers, letters, or symbols. Not just numbers!")
+	fmt.Println("❌ The key will be lost if the PIN and PUK are locked after 3 incorrect tries.")
+	fmt.Println("")
+	fmt.Print("Choose a new PIN/PUK: ")
+	pin, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Print("\n")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read PIN: %w", err)
+	}
+	if len(pin) != RequiredPINLength {
+		return nil, ErrInvalidPINLength{Required: RequiredPINLength, Got: len(pin)}
+	}
+	fmt.Print("Repeat PIN/PUK: ")
+	repeat, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fmt.Print("\n")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read PIN confirmation: %w", err)
+	}
+	if !bytes.Equal(repeat, pin) {
+		return nil, ErrPINMismatch
+	}
+	return pin, nil
+}
+
+// GetSingleYubiKey loads YubiKeys (respecting --serial) and ensures exactly one is found.
 // Returns the YubiKey and nil if successful, or nil and an error if failed.
 func GetSingleYubiKey() (*Yubi, error) {
-	yks, err := LoadYubiKeys()
+	return GetSingleYubiKeyContext(context.Background())
+}
+
+// GetSingleYubiKeyContext loads YubiKeys with context support and ensures exactly one is found.
+func GetSingleYubiKeyContext(ctx context.Context) (*Yubi, error) {
+	yks, err := LoadYubiKeysContext(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load YubiKeys: %w", err)
 	}
@@ -70,39 +115,33 @@ func GetSingleYubiKey() (*Yubi, error) {
 	return yks[0], nil
 }
 
+// printResetHint prints instructions for resetting the YubiKey.
+func printResetHint() {
+	fmt.Println("")
+	fmt.Println("If you know what you're doing, reset PIN, PUK, and")
+	fmt.Println("Management Key to the defaults before retrying.")
+	fmt.Println("")
+	fmt.Println("If you want to wipe all PIV keys and start fresh,")
+	fmt.Println("use --really-delete-all-piv-keys ⚠️")
+}
+
 // RunSetup sets up all four main PIV slots on a single YubiKey, generating
-// SSH-usable certificates in each. This function expects you’ve already
+// SSH-usable certificates in each. This function expects you've already
 // selected your one YubiKey, e.g. via RunSetupSelected().
-func RunSetup(yk *piv.YubiKey) {
-	log.SetFlags(0)
+func RunSetup(yk *piv.YubiKey) error {
 	if _, err := yk.Certificate(piv.SlotAuthentication); err == nil {
-		log.Println("‼️  This YubiKey looks already set up")
-		log.Println("")
-		log.Println("If you want to wipe all PIV keys and start fresh,")
-		log.Fatalln("use --really-delete-all-piv-keys ⚠⚠")
+		fmt.Println("‼️  This YubiKey looks already set up")
+		fmt.Println("")
+		fmt.Println("If you want to wipe all PIV keys and start fresh,")
+		fmt.Println("use --really-delete-all-piv-keys ⚠️")
+		return errors.New("YubiKey already set up")
 	} else if !errors.Is(err, piv.ErrNotFound) {
-		log.Fatalln("Failed to access authentication slot:", err)
+		return fmt.Errorf("failed to access authentication slot: %w", err)
 	}
 
-	fmt.Println("🔐 The PIN is up to 8 numbers, letters, or symbols. Not just numbers!")
-	fmt.Println("❌ The key will be lost if the PIN and PUK are locked after 3 incorrect tries.")
-	fmt.Println("")
-	fmt.Print("Choose a new PIN/PUK: ")
-	pin, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Print("\n")
+	pin, err := readPINWithConfirmation()
 	if err != nil {
-		log.Fatalln("Failed to read PIN:", err)
-	}
-	if len(pin) == 0 || len(pin) != RequiredPINLength {
-		log.Fatalf("The PIN needs to be %d characters.\n", RequiredPINLength)
-	}
-	fmt.Print("Repeat PIN/PUK: ")
-	repeat, err := term.ReadPassword(int(os.Stdin.Fd()))
-	fmt.Print("\n")
-	if err != nil {
-		log.Fatalln("Failed to read PIN:", err)
-	} else if !bytes.Equal(repeat, pin) {
-		log.Fatalln("PINs don't match!")
+		return err
 	}
 
 	fmt.Println("")
@@ -120,45 +159,33 @@ func RunSetup(yk *piv.YubiKey) {
 	// Generate a random new management key
 	key := make([]byte, 24)
 	if _, err := rand.Read(key); err != nil {
-		log.Fatal(err)
+		return fmt.Errorf("failed to generate management key: %w", err)
 	}
 	if err := yk.SetManagementKey(piv.DefaultManagementKey, key); err != nil {
-		log.Println("‼️ The default Management Key did not work")
-		log.Println("")
-		log.Println("If you know what you're doing, reset PIN, PUK, and")
-		log.Println("Management Key to the defaults before retrying.")
-		log.Println("")
-		log.Println("If you want to wipe all PIV keys and start fresh,")
-		log.Fatalln("use --really-delete-all-piv-keys ⚠️")
+		fmt.Println("‼️ The default Management Key did not work")
+		printResetHint()
+		return fmt.Errorf("failed to set management key: %w", err)
 	}
 	if err := yk.SetMetadata(key, &piv.Metadata{
 		ManagementKey: &key,
 	}); err != nil {
-		log.Fatalln("Failed to store the Management Key on the device:", err)
+		return fmt.Errorf("failed to store management key on device: %w", err)
 	}
 	if err := yk.SetPIN(piv.DefaultPIN, string(pin)); err != nil {
-		log.Println("‼️ The default PIN did not work")
-		log.Println("")
-		log.Println("If you know what you're doing, reset PIN, PUK, and")
-		log.Println("Management Key to the defaults before retrying.")
-		log.Println("")
-		log.Println("If you want to wipe all PIV keys and start fresh,")
-		log.Fatalln("use --really-delete-all-piv-keys ⚠️")
+		fmt.Println("‼️ The default PIN did not work")
+		printResetHint()
+		return fmt.Errorf("failed to set PIN: %w", err)
 	}
 	if err := yk.SetPUK(piv.DefaultPUK, string(pin)); err != nil {
-		log.Println("‼️ The default PUK did not work")
-		log.Println("")
-		log.Println("If you know what you're doing, reset PIN, PUK, and")
-		log.Println("Management Key to the defaults before retrying.")
-		log.Println("")
-		log.Println("If you want to wipe all PIV keys and start fresh,")
-		log.Fatalln("use --really-delete-all-piv-keys ⚠️")
+		fmt.Println("‼️ The default PUK did not work")
+		printResetHint()
+		return fmt.Errorf("failed to set PUK: %w", err)
 	}
 
 	// Generate keys for all configured slots
 	for _, cfg := range defaultSlotConfigs {
 		if err := generateAndStoreSSHKey(yk, key, cfg.slot, cfg.pinPolicy, cfg.touchPolicy); err != nil {
-			log.Fatalf("Failed to configure slot %x: %v", cfg.slot.Key, err)
+			return fmt.Errorf("failed to configure slot %x: %w", cfg.slot.Key, err)
 		}
 	}
 
@@ -170,15 +197,16 @@ func RunSetup(yk *piv.YubiKey) {
 	fmt.Println(`set the SSH_AUTH_SOCK environment variable, and test with "ssh-add -L"`)
 	fmt.Println("")
 	fmt.Println("💭 Remember: everything breaks, have a backup plan for when this YubiKey does.")
+	return nil
 }
 
-func randomSerialNumber() *big.Int {
+func randomSerialNumber() (*big.Int, error) {
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
 	if err != nil {
-		log.Fatalln("Failed to generate serial number:", err)
+		return nil, fmt.Errorf("failed to generate serial number: %w", err)
 	}
-	return serialNumber
+	return serialNumber, nil
 }
 
 // generateAndStoreSSHKey generates a new EC key on the given slot (with the
@@ -206,13 +234,17 @@ func generateAndStoreSSHKey(yk *piv.YubiKey, key []byte, slot piv.Slot, policy p
 		},
 		PublicKey: priv.Public(),
 	}
+	serial, err := randomSerialNumber()
+	if err != nil {
+		return err
+	}
 	template := &x509.Certificate{
 		Subject: pkix.Name{
 			CommonName: "SSH key",
 		},
 		NotAfter:     time.Now().AddDate(CertificateValidityYears, 0, 0),
 		NotBefore:    time.Now(),
-		SerialNumber: randomSerialNumber(),
+		SerialNumber: serial,
 		KeyUsage:     x509.KeyUsageKeyAgreement | x509.KeyUsageDigitalSignature,
 	}
 	certBytes, err := x509.CreateCertificate(rand.Reader, template, parent, pub, priv)
@@ -233,24 +265,22 @@ func generateAndStoreSSHKey(yk *piv.YubiKey, key []byte, slot piv.Slot, policy p
 	}
 
 	fmt.Printf("🔑 Here's your new shiny SSH public key for slot %x:\n", slot.Key)
-	os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey))
+	_, _ = os.Stdout.Write(ssh.MarshalAuthorizedKey(sshKey))
 	fmt.Println("")
 
 	return nil
 }
 
 // SetupSlot configures (or re-configures) a single PIV slot with a specified
-// PIN policy and touch policy. Demonstrates a more “incremental” approach,
+// PIN policy and touch policy. Demonstrates a more "incremental" approach,
 // rather than setting up all slots at once.
 //
 // If a management key is not yet stored in metadata, it will prompt for a PIN
 // (resetting from defaults). Otherwise, it reuses the existing management key.
-func SetupSlot(yk *piv.YubiKey, slot piv.Slot, pinPolicy piv.PINPolicy, touchPolicy piv.TouchPolicy) {
-	log.SetFlags(0)
-
+func SetupSlot(yk *piv.YubiKey, slot piv.Slot, pinPolicy piv.PINPolicy, touchPolicy piv.TouchPolicy) error {
 	var managementKey []byte
 
-	// Attempt to load an existing management key from the YubiKey’s metadata
+	// Attempt to load an existing management key from the YubiKey's metadata
 	metadata, err := yk.Metadata(string(piv.DefaultManagementKey))
 	if err == nil && metadata.ManagementKey != nil {
 		managementKey = *metadata.ManagementKey
@@ -259,25 +289,9 @@ func SetupSlot(yk *piv.YubiKey, slot piv.Slot, pinPolicy piv.PINPolicy, touchPol
 		// Need to set up the management key, PIN, and PUK from defaults
 		fmt.Println("🔐 No management key found in metadata. Need to set up YubiKey first.")
 		fmt.Println("")
-		fmt.Println("🔐 The PIN is up to 8 numbers, letters, or symbols. Not just numbers!")
-		fmt.Println("❌ The key will be lost if the PIN and PUK are locked after 3 incorrect tries.")
-		fmt.Println("")
-		fmt.Print("Choose a new PIN/PUK: ")
-		pin, err := term.ReadPassword(int(os.Stdin.Fd()))
-		fmt.Print("\n")
+		pin, err := readPINWithConfirmation()
 		if err != nil {
-			log.Fatalln("Failed to read PIN:", err)
-		}
-		if len(pin) == 0 || len(pin) != RequiredPINLength {
-			log.Fatalf("The PIN needs to be %d characters.\n", RequiredPINLength)
-		}
-		fmt.Print("Repeat PIN/PUK: ")
-		repeat, err := term.ReadPassword(int(os.Stdin.Fd()))
-		fmt.Print("\n")
-		if err != nil {
-			log.Fatalln("Failed to read PIN:", err)
-		} else if !bytes.Equal(repeat, pin) {
-			log.Fatalln("PINs don't match!")
+			return err
 		}
 
 		fmt.Println("")
@@ -285,45 +299,33 @@ func SetupSlot(yk *piv.YubiKey, slot piv.Slot, pinPolicy piv.PINPolicy, touchPol
 
 		managementKey = make([]byte, 24)
 		if _, err := rand.Read(managementKey); err != nil {
-			log.Fatal(err)
+			return fmt.Errorf("failed to generate management key: %w", err)
 		}
 
 		// Update the YubiKey from default credentials → new random management key
 		if err := yk.SetManagementKey(piv.DefaultManagementKey, managementKey); err != nil {
-			log.Println("‼️ The default Management Key did not work")
-			log.Println("")
-			log.Println("If you know what you're doing, reset PIN, PUK, and")
-			log.Println("Management Key to the defaults before retrying.")
-			log.Println("")
-			log.Println("If you want to wipe all PIV keys and start fresh,")
-			log.Fatalln("use setup --really-delete-all-piv-keys ⚠️")
+			fmt.Println("‼️ The default Management Key did not work")
+			printResetHint()
+			return fmt.Errorf("failed to set management key: %w", err)
 		}
 
 		// Store management key in protected metadata
 		if err := yk.SetMetadata(managementKey, &piv.Metadata{
 			ManagementKey: &managementKey,
 		}); err != nil {
-			log.Fatalln("Failed to store the Management Key on the device:", err)
+			return fmt.Errorf("failed to store management key on device: %w", err)
 		}
 
 		// Update PIN and PUK from default
 		if err := yk.SetPIN(piv.DefaultPIN, string(pin)); err != nil {
-			log.Println("‼️ The default PIN did not work")
-			log.Println("")
-			log.Println("If you know what you're doing, reset PIN, PUK, and")
-			log.Println("Management Key to the defaults before retrying.")
-			log.Println("")
-			log.Println("If you want to wipe all PIV keys and start fresh,")
-			log.Fatalln("use setup --really-delete-all-piv-keys ⚠️")
+			fmt.Println("‼️ The default PIN did not work")
+			printResetHint()
+			return fmt.Errorf("failed to set PIN: %w", err)
 		}
 		if err := yk.SetPUK(piv.DefaultPUK, string(pin)); err != nil {
-			log.Println("‼️ The default PUK did not work")
-			log.Println("")
-			log.Println("If you know what you're doing, reset PIN, PUK, and")
-			log.Println("Management Key to the defaults before retrying.")
-			log.Println("")
-			log.Println("If you want to wipe all PIV keys and start fresh,")
-			log.Fatalln("use setup --really-delete-all-piv-keys ⚠️")
+			fmt.Println("‼️ The default PUK did not work")
+			printResetHint()
+			return fmt.Errorf("failed to set PUK: %w", err)
 		}
 	}
 
@@ -332,7 +334,7 @@ func SetupSlot(yk *piv.YubiKey, slot piv.Slot, pinPolicy piv.PINPolicy, touchPol
 		slot.Key, pinPolicy, touchPolicy)
 
 	if err := generateAndStoreSSHKey(yk, managementKey, slot, pinPolicy, touchPolicy); err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	fmt.Println("")
@@ -342,4 +344,5 @@ func SetupSlot(yk *piv.YubiKey, slot piv.Slot, pinPolicy piv.PINPolicy, touchPol
 	}
 	fmt.Println("")
 	fmt.Println("Next steps: ensure yubikey-agent is running, and test with \"ssh-add -L\"")
+	return nil
 }

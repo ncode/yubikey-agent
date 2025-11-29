@@ -6,7 +6,6 @@
 // https://developers.google.com/open-source/licenses/bsd
 
 //go:build !darwin
-// +build !darwin
 
 package agent
 

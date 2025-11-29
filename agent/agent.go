@@ -45,13 +45,19 @@ const (
 
 	// SocketDirPermissions is the permission mode for the socket directory
 	SocketDirPermissions = 0700
+
+	// SignOperationTimeout is the maximum time allowed for a sign operation
+	// This prevents indefinite blocking waiting for YubiKey touch
+	SignOperationTimeout = 2 * time.Minute
 )
 
+// enabledSlots lists all PIV slots that yubikey-agent will use for SSH keys.
+// These slots are configured during setup with different PIN and touch policies.
 var enabledSlots = []piv.Slot{
-	piv.SlotAuthentication,
-	piv.SlotSignature,
-	piv.SlotKeyManagement,
-	piv.SlotCardAuthentication,
+	piv.SlotAuthentication,     // 9a - PIN once, touch always
+	piv.SlotSignature,          // 9c - PIN always, touch always
+	piv.SlotKeyManagement,      // 9d - PIN once, touch never
+	piv.SlotCardAuthentication, // 9e - PIN never, touch never
 }
 
 // Yubi contains all the information about a YubiKey
@@ -65,6 +71,17 @@ type Yubi struct {
 // only the matching YubiKey will be returned. This ensures we never "touch"
 // any other YubiKeys if `serial` is set.
 func LoadYubiKeys() ([]*Yubi, error) {
+	return LoadYubiKeysContext(context.Background())
+}
+
+// LoadYubiKeysContext loads all connected YubiKeys with context support.
+// If ctx is cancelled during loading, it returns ctx.Err().
+func LoadYubiKeysContext(ctx context.Context) ([]*Yubi, error) {
+	// Check context before starting
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	cards, err := piv.Cards()
 	if err != nil {
 		return nil, err
@@ -77,32 +94,27 @@ func LoadYubiKeys() ([]*Yubi, error) {
 	var yubikeys []*Yubi
 
 	for _, card := range cards {
-		// Only consider Yubico cards
-		if !strings.HasPrefix(strings.ToLower(card), "yubico") {
-			continue
-		}
-		device, err := piv.Open(card)
-		if err != nil {
-			// Could not open this card; skip
-			continue
-		}
-		sn, err := device.Serial()
-		if err != nil {
-			// Log warning but continue with serial 0
-			log.Printf("Warning: failed to get serial for %s: %v", card, err)
+		// Check context before each card
+		if err := ctx.Err(); err != nil {
+			// Clean up any already-opened devices
+			for _, yk := range yubikeys {
+				_ = yk.Device.Close()
+			}
+			return nil, err
 		}
 
-		// If a serial is provided and this doesn't match, skip this device entirely.
-		if serial != 0 && sn != serial {
-			device.Close()
+		yk, err := tryOpenYubiKey(card, serial)
+		if err != nil {
+			// Log and skip this card
+			log.Printf("Skipping card %s: %v", card, err)
+			continue
+		}
+		if yk == nil {
+			// This card was filtered out (wrong serial), already closed
 			continue
 		}
 
-		yubikeys = append(yubikeys, &Yubi{
-			Name:   card,
-			Serial: sn,
-			Device: device,
-		})
+		yubikeys = append(yubikeys, yk)
 
 		// If we were looking for a specific serial, we can stop early after finding it.
 		if serial != 0 {
@@ -118,6 +130,49 @@ func LoadYubiKeys() ([]*Yubi, error) {
 		return nil, errors.New("unable to connect to any YubiKey device")
 	}
 	return yubikeys, nil
+}
+
+// tryOpenYubiKey attempts to open and validate a single YubiKey card.
+// Returns nil, nil if the card should be skipped (e.g., wrong serial).
+// Returns nil, error if there was an error opening the card.
+// Returns *Yubi, nil if the card was successfully opened and validated.
+func tryOpenYubiKey(card string, filterSerial uint32) (*Yubi, error) {
+	// Only consider Yubico cards
+	if !strings.HasPrefix(strings.ToLower(card), "yubico") {
+		return nil, nil
+	}
+
+	device, err := piv.Open(card)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open: %w", err)
+	}
+
+	// Ensure device is closed if we don't return it successfully
+	var yk *Yubi
+	defer func() {
+		if yk == nil {
+			_ = device.Close()
+		}
+	}()
+
+	sn, err := device.Serial()
+	if err != nil {
+		// Log warning but continue with serial 0
+		log.Printf("Warning: failed to get serial for %s: %v", card, err)
+		sn = 0
+	}
+
+	// If a serial is provided and this doesn't match, filter it out
+	if filterSerial != 0 && sn != filterSerial {
+		return nil, nil
+	}
+
+	yk = &Yubi{
+		Name:   card,
+		Serial: sn,
+		Device: device,
+	}
+	return yk, nil
 }
 
 // Run executes the agent using the specified socket path
@@ -137,7 +192,7 @@ func Run() {
 	signal.Notify(c, syscall.SIGHUP)
 	go func() {
 		for range c {
-			a.Close()
+			_ = a.Close()
 		}
 	}()
 
@@ -172,7 +227,7 @@ func Run() {
 // Agent holds status of the current agent in use and
 // all yubikeys associated with it
 type Agent struct {
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	// Instead of a single YubiKey, store all discovered YubiKeys:
 	yks []*Yubi
@@ -191,10 +246,11 @@ func (a *Agent) serveConn(c net.Conn) {
 	}
 }
 
-func healthy(yk *piv.YubiKey) bool {
-	// We can't use Serial because it locks the session on older firmwares, and
-	// can't use Retries because it fails when the session is unlocked.
-	_, err := yk.AttestationCertificate()
+// healthy checks if the YubiKey connection is still functional.
+// We can't use Serial because it locks the session on older firmwares, and
+// can't use Retries because it fails when the session is unlocked.
+func (y *Yubi) healthy() bool {
+	_, err := y.Device.AttestationCertificate()
 	return err == nil
 }
 
@@ -205,7 +261,7 @@ func (a *Agent) ensureYK() error {
 	if len(a.yks) > 0 {
 		allHealthy := true
 		for _, yk := range a.yks {
-			if !healthy(yk.Device) {
+			if !yk.healthy() {
 				allHealthy = false
 				break
 			}
@@ -280,6 +336,7 @@ func (a *Agent) List() ([]*agent.Key, error) {
 	return keys, nil
 }
 
+// getPublicKey retrieves the SSH public key from a specific PIV slot.
 func getPublicKey(yk *piv.YubiKey, slot piv.Slot) (ssh.PublicKey, error) {
 	cert, err := yk.Certificate(slot)
 	if err != nil {
@@ -298,7 +355,8 @@ func getPublicKey(yk *piv.YubiKey, slot piv.Slot) (ssh.PublicKey, error) {
 	return pk, nil
 }
 
-// Signers returns signers for all available keys on all YubiKeys.
+// Signers implements the agent.ExtendedAgent interface, returning signers for all keys.
+// This method locks the agent and ensures YubiKey connections are healthy.
 func (a *Agent) Signers() ([]ssh.Signer, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -350,6 +408,8 @@ func (a *Agent) signers() ([]ssh.Signer, error) {
 	return signers, nil
 }
 
+// Sign implements the agent.Agent interface for signing data with a key.
+// This method delegates to SignWithFlags with no flags set.
 func (a *Agent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
 	return a.SignWithFlags(key, data, 0)
 }
@@ -370,17 +430,27 @@ func (a *Agent) setupTouchNotification() (context.Context, context.CancelFunc) {
 	return ctx, cancel
 }
 
-// determineSignatureAlgorithm determines the signature algorithm based on key type and flags
-func determineSignatureAlgorithm(key ssh.PublicKey, flags agent.SignatureFlags) string {
+// signatureAlgorithm determines the signature algorithm based on key type and flags
+func signatureAlgorithm(key ssh.PublicKey, flags agent.SignatureFlags) string {
 	alg := key.Type()
 	switch {
 	case alg == ssh.KeyAlgoRSA && (flags&agent.SignatureFlagRsaSha256 != 0):
-		return ssh.SigAlgoRSASHA2256
+		return ssh.KeyAlgoRSASHA256
 	case alg == ssh.KeyAlgoRSA && (flags&agent.SignatureFlagRsaSha512 != 0):
-		return ssh.SigAlgoRSASHA2512
+		return ssh.KeyAlgoRSASHA512
 	default:
 		return alg
 	}
+}
+
+// isRetriableAuthError checks if an error is a piv.AuthErr with remaining retries.
+// Returns the number of remaining retries if retriable, 0 otherwise.
+func isRetriableAuthError(err error) int {
+	var authErr *piv.AuthErr
+	if errors.As(err, &authErr) && authErr.Retries > 0 {
+		return authErr.Retries
+	}
+	return 0
 }
 
 // performSignature attempts to sign data with the matching signer
@@ -393,10 +463,6 @@ func (a *Agent) performSignature(signers []ssh.Signer, key ssh.PublicKey, data [
 
 		sg, err := s.(ssh.AlgorithmSigner).SignWithAlgorithm(rand.Reader, data, alg)
 		if err != nil {
-			// If the PIN prompt indicated we still have retries left, try again
-			if strings.Contains(err.Error(), "remaining") {
-				return nil, err // Let caller retry
-			}
 			return nil, err
 		}
 		return sg, nil
@@ -404,6 +470,8 @@ func (a *Agent) performSignature(signers []ssh.Signer, key ssh.PublicKey, data [
 	return nil, fmt.Errorf("no private keys match the requested public key")
 }
 
+// SignWithFlags implements the agent.ExtendedAgent interface for signing with algorithm selection.
+// This operation has a 2-minute timeout to prevent indefinite blocking on YubiKey touch.
 func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -411,56 +479,107 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 		return nil, fmt.Errorf("could not reach YubiKeys: %w", err)
 	}
 
-	_, cancel := a.setupTouchNotification()
+	// Create context with timeout for the entire sign operation
+	ctx, cancel := context.WithTimeout(context.Background(), SignOperationTimeout)
 	defer cancel()
 
-	alg := determineSignatureAlgorithm(key, flags)
+	// Set up touch notification
+	_, cancelTouch := a.setupTouchNotification()
+	defer cancelTouch()
 
-	for {
-		signers, err := a.signers()
-		if err != nil {
-			return nil, err
-		}
+	alg := signatureAlgorithm(key, flags)
 
-		sig, err := a.performSignature(signers, key, data, alg)
-		if err != nil && strings.Contains(err.Error(), "remaining") {
-			// Retry if PIN failed but we have retries left
-			continue
+	// Channel to receive signature result
+	type result struct {
+		sig *ssh.Signature
+		err error
+	}
+	resultCh := make(chan result, 1)
+
+	go func() {
+		var lastRetries int
+		for {
+			// Check if context cancelled before attempting
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			signers, err := a.signers()
+			if err != nil {
+				resultCh <- result{nil, err}
+				return
+			}
+
+			sig, err := a.performSignature(signers, key, data, alg)
+			if err != nil {
+				retries := isRetriableAuthError(err)
+				// Only retry if we have retries left and they're decreasing
+				// (prevents infinite loop if retries stays the same)
+				if retries > 0 && (lastRetries == 0 || retries < lastRetries) {
+					lastRetries = retries
+					continue
+				}
+			}
+			resultCh <- result{sig, err}
+			return
 		}
-		return sig, err
+	}()
+
+	// Wait for either result or timeout
+	select {
+	case res := <-resultCh:
+		return res.sig, res.err
+	case <-ctx.Done():
+		return nil, fmt.Errorf("sign operation timed out after %v (touch required?): %w", SignOperationTimeout, ctx.Err())
 	}
 }
 
+// showNotification displays a system notification on macOS and Linux.
+// Notification failures are intentionally ignored as they are non-critical.
 func showNotification(message string) {
 	switch runtime.GOOS {
 	case "darwin":
 		message = strings.ReplaceAll(message, `\`, `\\`)
 		message = strings.ReplaceAll(message, `"`, `\"`)
 		appleScript := `display notification "%s" with title "yubikey-agent"`
-		exec.Command("osascript", "-e", fmt.Sprintf(appleScript, message)).Run()
+		_ = exec.Command("osascript", "-e", fmt.Sprintf(appleScript, message)).Run()
 	case "linux":
-		exec.Command("notify-send", "-i", "dialog-password", "yubikey-agent", message).Run()
+		_ = exec.Command("notify-send", "-i", "dialog-password", "yubikey-agent", message).Run()
 	}
 }
 
+// Extension implements the agent.ExtendedAgent interface but no extensions are supported.
 func (a *Agent) Extension(extensionType string, contents []byte) ([]byte, error) {
 	return nil, agent.ErrExtensionUnsupported
 }
 
+// ErrOperationUnsupported is returned for agent operations not supported by yubikey-agent.
+// Since keys are hardware-bound, operations like Add/Remove don't apply.
 var ErrOperationUnsupported = errors.New("operation unsupported")
 
+// Add is not supported as keys cannot be added to hardware tokens remotely.
 func (a *Agent) Add(key agent.AddedKey) error {
 	return ErrOperationUnsupported
 }
+
+// Remove is not supported as keys cannot be removed from hardware tokens remotely.
 func (a *Agent) Remove(key ssh.PublicKey) error {
 	return ErrOperationUnsupported
 }
+
+// RemoveAll is not supported as keys cannot be removed from hardware tokens remotely.
 func (a *Agent) RemoveAll() error {
 	return ErrOperationUnsupported
 }
+
+// Lock is not supported as the YubiKey itself handles PIN-based locking.
 func (a *Agent) Lock(passphrase []byte) error {
 	return ErrOperationUnsupported
 }
+
+// Unlock is not supported as the YubiKey itself handles PIN-based unlocking.
 func (a *Agent) Unlock(passphrase []byte) error {
 	return ErrOperationUnsupported
 }
