@@ -39,5 +39,5 @@ var listCmd = &cobra.Command{
 func init() {
 	rootCmd.AddCommand(listCmd)
 	listCmd.Flags().BoolVar(&plainOutput, "plain", false, "use plain text output without emojis")
-	viper.BindPFlag("plain", listCmd.Flags().Lookup("plain"))
+	_ = viper.BindPFlag("plain", listCmd.Flags().Lookup("plain"))
 }

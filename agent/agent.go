@@ -98,7 +98,7 @@ func LoadYubiKeysContext(ctx context.Context) ([]*Yubi, error) {
 		if err := ctx.Err(); err != nil {
 			// Clean up any already-opened devices
 			for _, yk := range yubikeys {
-				yk.Device.Close()
+				_ = yk.Device.Close()
 			}
 			return nil, err
 		}
@@ -151,7 +151,7 @@ func tryOpenYubiKey(card string, filterSerial uint32) (*Yubi, error) {
 	var yk *Yubi
 	defer func() {
 		if yk == nil {
-			device.Close()
+			_ = device.Close()
 		}
 	}()
 
@@ -192,7 +192,7 @@ func Run() {
 	signal.Notify(c, syscall.SIGHUP)
 	go func() {
 		for range c {
-			a.Close()
+			_ = a.Close()
 		}
 	}()
 
@@ -435,12 +435,22 @@ func signatureAlgorithm(key ssh.PublicKey, flags agent.SignatureFlags) string {
 	alg := key.Type()
 	switch {
 	case alg == ssh.KeyAlgoRSA && (flags&agent.SignatureFlagRsaSha256 != 0):
-		return ssh.SigAlgoRSASHA2256
+		return ssh.KeyAlgoRSASHA256
 	case alg == ssh.KeyAlgoRSA && (flags&agent.SignatureFlagRsaSha512 != 0):
-		return ssh.SigAlgoRSASHA2512
+		return ssh.KeyAlgoRSASHA512
 	default:
 		return alg
 	}
+}
+
+// isRetriableAuthError checks if an error is a piv.AuthErr with remaining retries.
+// Returns the number of remaining retries if retriable, 0 otherwise.
+func isRetriableAuthError(err error) int {
+	var authErr *piv.AuthErr
+	if errors.As(err, &authErr) && authErr.Retries > 0 {
+		return authErr.Retries
+	}
+	return 0
 }
 
 // performSignature attempts to sign data with the matching signer
@@ -453,10 +463,6 @@ func (a *Agent) performSignature(signers []ssh.Signer, key ssh.PublicKey, data [
 
 		sg, err := s.(ssh.AlgorithmSigner).SignWithAlgorithm(rand.Reader, data, alg)
 		if err != nil {
-			// If the PIN prompt indicated we still have retries left, try again
-			if strings.Contains(err.Error(), "remaining") {
-				return nil, err // Let caller retry
-			}
 			return nil, err
 		}
 		return sg, nil
@@ -491,7 +497,15 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 	resultCh := make(chan result, 1)
 
 	go func() {
+		var lastRetries int
 		for {
+			// Check if context cancelled before attempting
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			signers, err := a.signers()
 			if err != nil {
 				resultCh <- result{nil, err}
@@ -499,9 +513,14 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 			}
 
 			sig, err := a.performSignature(signers, key, data, alg)
-			if err != nil && strings.Contains(err.Error(), "remaining") {
-				// Retry if PIN failed but we have retries left
-				continue
+			if err != nil {
+				retries := isRetriableAuthError(err)
+				// Only retry if we have retries left and they're decreasing
+				// (prevents infinite loop if retries stays the same)
+				if retries > 0 && (lastRetries == 0 || retries < lastRetries) {
+					lastRetries = retries
+					continue
+				}
 			}
 			resultCh <- result{sig, err}
 			return
@@ -518,15 +537,16 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 }
 
 // showNotification displays a system notification on macOS and Linux.
+// Notification failures are intentionally ignored as they are non-critical.
 func showNotification(message string) {
 	switch runtime.GOOS {
 	case "darwin":
 		message = strings.ReplaceAll(message, `\`, `\\`)
 		message = strings.ReplaceAll(message, `"`, `\"`)
 		appleScript := `display notification "%s" with title "yubikey-agent"`
-		exec.Command("osascript", "-e", fmt.Sprintf(appleScript, message)).Run()
+		_ = exec.Command("osascript", "-e", fmt.Sprintf(appleScript, message)).Run()
 	case "linux":
-		exec.Command("notify-send", "-i", "dialog-password", "yubikey-agent", message).Run()
+		_ = exec.Command("notify-send", "-i", "dialog-password", "yubikey-agent", message).Run()
 	}
 }
 

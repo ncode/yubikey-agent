@@ -14,8 +14,6 @@ import (
 
 	"github.com/ncode/yubikey-agent/agent"
 	"github.com/spf13/cobra"
-
-	homedir "github.com/mitchellh/go-homedir"
 	"github.com/spf13/viper"
 )
 
@@ -47,15 +45,15 @@ var homeDir string
 func init() {
 	cobra.OnInitialize(initConfig)
 	var err error
-	homeDir, err = homedir.Dir()
+	homeDir, err = os.UserHomeDir()
 	if err != nil {
 		log.Fatalf("Failed to determine home directory: %v", err)
 	}
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.yubikey-agent.yaml)")
 	rootCmd.PersistentFlags().Uint32P("serial", "s", 0, "serial of the device you would like to use")
-	viper.BindPFlag("serial", rootCmd.PersistentFlags().Lookup("serial"))
+	_ = viper.BindPFlag("serial", rootCmd.PersistentFlags().Lookup("serial"))
 	rootCmd.PersistentFlags().StringP("listen", "l", fmt.Sprintf("%s/.ssh/yubikey-agent.sock", homeDir), "Run the agent, listening on the UNIX socket at PATH (default is $HOME/.ssh.yubikey-agent.sock)")
-	viper.BindPFlag("listen", rootCmd.PersistentFlags().Lookup("listen"))
+	_ = viper.BindPFlag("listen", rootCmd.PersistentFlags().Lookup("listen"))
 
 	if Version != "" {
 		rootCmd.Version = Version
@@ -80,6 +78,6 @@ func initConfig() {
 
 	viper.AutomaticEnv() // read in environment variables that match
 
-	// If a config file is found, read it in silently
-	viper.ReadInConfig()
+	// If a config file is found, read it in silently (ignore errors)
+	_ = viper.ReadInConfig()
 }

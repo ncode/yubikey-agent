@@ -77,3 +77,51 @@ func TestConstants(t *testing.T) {
 		t.Errorf("CertificateValidityYears = %d, want 42", CertificateValidityYears)
 	}
 }
+
+// TestErrInvalidPINLength tests the ErrInvalidPINLength error type
+func TestErrInvalidPINLength(t *testing.T) {
+	tests := []struct {
+		name     string
+		required int
+		got      int
+		expected string
+	}{
+		{
+			name:     "too short",
+			required: 8,
+			got:      4,
+			expected: "PIN needs to be 8 characters, got 4",
+		},
+		{
+			name:     "too long",
+			required: 8,
+			got:      12,
+			expected: "PIN needs to be 8 characters, got 12",
+		},
+		{
+			name:     "empty",
+			required: 8,
+			got:      0,
+			expected: "PIN needs to be 8 characters, got 0",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ErrInvalidPINLength{Required: tt.required, Got: tt.got}
+			if err.Error() != tt.expected {
+				t.Errorf("ErrInvalidPINLength.Error() = %q, want %q", err.Error(), tt.expected)
+			}
+		})
+	}
+}
+
+// TestErrPINMismatch tests the ErrPINMismatch sentinel error
+func TestErrPINMismatch(t *testing.T) {
+	if ErrPINMismatch == nil {
+		t.Error("ErrPINMismatch should not be nil")
+	}
+	if ErrPINMismatch.Error() != "PINs don't match" {
+		t.Errorf("ErrPINMismatch.Error() = %q, want %q", ErrPINMismatch.Error(), "PINs don't match")
+	}
+}

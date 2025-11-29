@@ -8,9 +8,11 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/go-piv/piv-go/v2/piv"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
 )
@@ -27,13 +29,13 @@ func TestSignatureAlgorithm(t *testing.T) {
 			name:     "RSA with SHA256 flag",
 			keyType:  ssh.KeyAlgoRSA,
 			flags:    agent.SignatureFlagRsaSha256,
-			expected: ssh.SigAlgoRSASHA2256,
+			expected: ssh.KeyAlgoRSASHA256,
 		},
 		{
 			name:     "RSA with SHA512 flag",
 			keyType:  ssh.KeyAlgoRSA,
 			flags:    agent.SignatureFlagRsaSha512,
-			expected: ssh.SigAlgoRSASHA2512,
+			expected: ssh.KeyAlgoRSASHA512,
 		},
 		{
 			name:     "RSA with no flags",
@@ -120,4 +122,100 @@ func (m *mockPublicKey) Marshal() []byte {
 
 func (m *mockPublicKey) Verify(data []byte, sig *ssh.Signature) error {
 	return nil
+}
+
+// TestIsRetriableAuthError tests the isRetriableAuthError function
+func TestIsRetriableAuthError(t *testing.T) {
+	tests := []struct {
+		name            string
+		err             error
+		expectedRetries int
+	}{
+		{
+			name:            "nil error",
+			err:             nil,
+			expectedRetries: 0,
+		},
+		{
+			name:            "generic error",
+			err:             errors.New("some error"),
+			expectedRetries: 0,
+		},
+		{
+			name:            "AuthErr with retries",
+			err:             &piv.AuthErr{Retries: 2},
+			expectedRetries: 2,
+		},
+		{
+			name:            "AuthErr with zero retries",
+			err:             &piv.AuthErr{Retries: 0},
+			expectedRetries: 0,
+		},
+		{
+			name:            "AuthErr with one retry",
+			err:             &piv.AuthErr{Retries: 1},
+			expectedRetries: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isRetriableAuthError(tt.err)
+			if result != tt.expectedRetries {
+				t.Errorf("isRetriableAuthError() = %d, want %d", result, tt.expectedRetries)
+			}
+		})
+	}
+}
+
+// TestIsRetriableAuthErrorWrapped tests that isRetriableAuthError works with wrapped errors
+func TestIsRetriableAuthErrorWrapped(t *testing.T) {
+	authErr := &piv.AuthErr{Retries: 3}
+	wrappedErr := errors.Join(errors.New("operation failed"), authErr)
+
+	result := isRetriableAuthError(wrappedErr)
+	if result != 3 {
+		t.Errorf("isRetriableAuthError() with wrapped error = %d, want 3", result)
+	}
+}
+
+// TestErrOperationUnsupported tests the ErrOperationUnsupported sentinel error
+func TestErrOperationUnsupported(t *testing.T) {
+	if ErrOperationUnsupported == nil {
+		t.Error("ErrOperationUnsupported should not be nil")
+	}
+	if ErrOperationUnsupported.Error() != "operation unsupported" {
+		t.Errorf("ErrOperationUnsupported.Error() = %q, want %q",
+			ErrOperationUnsupported.Error(), "operation unsupported")
+	}
+}
+
+// TestAgentUnsupportedOperations tests that unsupported operations return correct error
+func TestAgentUnsupportedOperations(t *testing.T) {
+	a := &Agent{}
+
+	if err := a.Add(agent.AddedKey{}); err != ErrOperationUnsupported {
+		t.Errorf("Add() = %v, want ErrOperationUnsupported", err)
+	}
+	if err := a.Remove(nil); err != ErrOperationUnsupported {
+		t.Errorf("Remove() = %v, want ErrOperationUnsupported", err)
+	}
+	if err := a.RemoveAll(); err != ErrOperationUnsupported {
+		t.Errorf("RemoveAll() = %v, want ErrOperationUnsupported", err)
+	}
+	if err := a.Lock(nil); err != ErrOperationUnsupported {
+		t.Errorf("Lock() = %v, want ErrOperationUnsupported", err)
+	}
+	if err := a.Unlock(nil); err != ErrOperationUnsupported {
+		t.Errorf("Unlock() = %v, want ErrOperationUnsupported", err)
+	}
+}
+
+// TestAgentExtension tests that Extension returns ErrExtensionUnsupported
+func TestAgentExtension(t *testing.T) {
+	a := &Agent{}
+	_, err := a.Extension("test", nil)
+	if err != agent.ErrExtensionUnsupported {
+		t.Errorf("Extension() = %v, want ErrExtensionUnsupported", err)
+	}
 }

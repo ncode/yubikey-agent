@@ -31,8 +31,7 @@ var setupCmd = &cobra.Command{
 				return fmt.Errorf("failed to reset YubiKey: %w", err)
 			}
 		}
-		agent.RunSetup(yk.Device)
-		return nil
+		return agent.RunSetup(yk.Device)
 	},
 }
 
