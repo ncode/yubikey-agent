@@ -470,6 +470,62 @@ func (a *Agent) performSignature(signers []ssh.Signer, key ssh.PublicKey, data [
 	return nil, fmt.Errorf("no private keys match the requested public key")
 }
 
+func signWithRetryAndTimeout(
+	ctx context.Context,
+	getSigners func() ([]ssh.Signer, error),
+	perform func(signers []ssh.Signer) (*ssh.Signature, error),
+) (*ssh.Signature, error) {
+	type result struct {
+		sig *ssh.Signature
+		err error
+	}
+
+	var lastRetries int
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		signers, err := getSigners()
+		if err != nil {
+			return nil, err
+		}
+
+		resultCh := make(chan result, 1)
+		go func() {
+			sig, err := perform(signers)
+			select {
+			case resultCh <- result{sig: sig, err: err}:
+			case <-ctx.Done():
+			}
+		}()
+
+		var (
+			sig     *ssh.Signature
+			signErr error
+		)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case res := <-resultCh:
+			sig = res.sig
+			signErr = res.err
+		}
+
+		if signErr == nil {
+			return sig, nil
+		}
+
+		retries := isRetriableAuthError(signErr)
+		if retries > 0 && (lastRetries == 0 || retries < lastRetries) {
+			lastRetries = retries
+			continue
+		}
+
+		return nil, signErr
+	}
+}
+
 // SignWithFlags implements the agent.ExtendedAgent interface for signing with algorithm selection.
 // This operation has a 2-minute timeout to prevent indefinite blocking on YubiKey touch.
 func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
@@ -489,51 +545,17 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 
 	alg := signatureAlgorithm(key, flags)
 
-	// Channel to receive signature result
-	type result struct {
-		sig *ssh.Signature
-		err error
+	sig, err := signWithRetryAndTimeout(
+		ctx,
+		a.signers,
+		func(signers []ssh.Signer) (*ssh.Signature, error) {
+			return a.performSignature(signers, key, data, alg)
+		},
+	)
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return nil, fmt.Errorf("sign operation timed out after %v (touch required?): %w", SignOperationTimeout, err)
 	}
-	resultCh := make(chan result, 1)
-
-	go func() {
-		var lastRetries int
-		for {
-			// Check if context cancelled before attempting
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-
-			signers, err := a.signers()
-			if err != nil {
-				resultCh <- result{nil, err}
-				return
-			}
-
-			sig, err := a.performSignature(signers, key, data, alg)
-			if err != nil {
-				retries := isRetriableAuthError(err)
-				// Only retry if we have retries left and they're decreasing
-				// (prevents infinite loop if retries stays the same)
-				if retries > 0 && (lastRetries == 0 || retries < lastRetries) {
-					lastRetries = retries
-					continue
-				}
-			}
-			resultCh <- result{sig, err}
-			return
-		}
-	}()
-
-	// Wait for either result or timeout
-	select {
-	case res := <-resultCh:
-		return res.sig, res.err
-	case <-ctx.Done():
-		return nil, fmt.Errorf("sign operation timed out after %v (touch required?): %w", SignOperationTimeout, ctx.Err())
-	}
+	return sig, err
 }
 
 // showNotification displays a system notification on macOS and Linux.
