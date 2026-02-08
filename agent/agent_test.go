@@ -219,3 +219,69 @@ func TestAgentExtension(t *testing.T) {
 		t.Errorf("Extension() = %v, want ErrExtensionUnsupported", err)
 	}
 }
+
+func TestSignWithRetryAndTimeoutContextDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	retries := 100
+
+	_, err := signWithRetryAndTimeout(
+		ctx,
+		func() ([]ssh.Signer, error) { return nil, nil },
+		func(signers []ssh.Signer) (*ssh.Signature, error) {
+			time.Sleep(time.Millisecond)
+			retries--
+			return nil, &piv.AuthErr{Retries: retries}
+		},
+	)
+
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("signWithRetryAndTimeout() error = %v, want context deadline exceeded", err)
+	}
+}
+
+func TestSignWithRetryAndTimeoutRetryStopsWithoutProgress(t *testing.T) {
+	attempts := 0
+
+	_, err := signWithRetryAndTimeout(
+		context.Background(),
+		func() ([]ssh.Signer, error) { return nil, nil },
+		func(signers []ssh.Signer) (*ssh.Signature, error) {
+			attempts++
+			return nil, &piv.AuthErr{Retries: 2}
+		},
+	)
+
+	if attempts != 2 {
+		t.Fatalf("attempt count = %d, want 2", attempts)
+	}
+	if err == nil {
+		t.Fatal("signWithRetryAndTimeout() expected error, got nil")
+	}
+}
+
+func TestSignWithRetryAndTimeoutReturnsOnContextWhilePerformBlocks(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := signWithRetryAndTimeout(
+			ctx,
+			func() ([]ssh.Signer, error) { return nil, nil },
+			func(signers []ssh.Signer) (*ssh.Signature, error) {
+				select {}
+			},
+		)
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("signWithRetryAndTimeout() error = %v, want context deadline exceeded", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("signWithRetryAndTimeout() did not return after context deadline")
+	}
+}

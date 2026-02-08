@@ -45,8 +45,8 @@ type slotConfig struct {
 var defaultSlotConfigs = []slotConfig{
 	{piv.SlotAuthentication, piv.PINPolicyOnce, piv.TouchPolicyAlways},
 	{piv.SlotSignature, piv.PINPolicyAlways, piv.TouchPolicyAlways},
-	{piv.SlotCardAuthentication, piv.PINPolicyOnce, piv.TouchPolicyNever},
-	{piv.SlotKeyManagement, piv.PINPolicyNever, piv.TouchPolicyNever},
+	{piv.SlotCardAuthentication, piv.PINPolicyNever, piv.TouchPolicyNever},
+	{piv.SlotKeyManagement, piv.PINPolicyOnce, piv.TouchPolicyNever},
 }
 
 // Version contains the build version of yubikey-agent, set at build time.

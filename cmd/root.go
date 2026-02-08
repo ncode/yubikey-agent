@@ -52,7 +52,7 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.yubikey-agent.yaml)")
 	rootCmd.PersistentFlags().Uint32P("serial", "s", 0, "serial of the device you would like to use")
 	_ = viper.BindPFlag("serial", rootCmd.PersistentFlags().Lookup("serial"))
-	rootCmd.PersistentFlags().StringP("listen", "l", fmt.Sprintf("%s/.ssh/yubikey-agent.sock", homeDir), "Run the agent, listening on the UNIX socket at PATH (default is $HOME/.ssh.yubikey-agent.sock)")
+	rootCmd.PersistentFlags().StringP("listen", "l", fmt.Sprintf("%s/.ssh/yubikey-agent.sock", homeDir), "Run the agent, listening on the UNIX socket at PATH (default is $HOME/.ssh/yubikey-agent.sock)")
 	_ = viper.BindPFlag("listen", rootCmd.PersistentFlags().Lookup("listen"))
 
 	if Version != "" {

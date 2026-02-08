@@ -1,33 +1,41 @@
 # Manual Linux setup with systemd
 
-Note: this is usually only necessary in case your distribution doesn't already
-provide a yubikey-agent as a package.
+This repository no longer ships a built-in systemd unit file. If you want to run `yubikey-agent` with a user service, create your own user unit.
 
-Refer to [the README](README) for a list of distributions providing packages.
-
-First, install Go and the [`piv-go` dependencies](https://github.com/go-piv/piv-go#installation), build `yubikey-agent` and place it in `$PATH`.
+First, install Go and the [`piv-go` dependencies](https://github.com/go-piv/piv-go#installation), build `yubikey-agent`, and place it in `$PATH`.
 
 ```text
-$ git clone https://filippo.io/yubikey-agent && cd yubikey-agent
+$ git clone https://github.com/ncode/yubikey-agent && cd yubikey-agent
 $ go build && sudo cp yubikey-agent /usr/local/bin/
 ```
 
-Make sure you have a `pinentry` program that works for you (terminal-based or graphical) in `$PATH`.
+Make sure you have a `pinentry` program (terminal or graphical) in `$PATH`.
 
-Use `yubikey-agent -setup` to create a new key on the YubiKey.
+Set up your key first:
 
 ```text
-$ yubikey-agent -setup
+$ yubikey-agent setup
 ```
 
-Then, create a systemd user service at `~/.config/systemd/user/yubikey-agent.service`
-with the contents of [yubikey-agent.service](contrib/systemd/user/yubikey-agent.service).
+Then create `~/.config/systemd/user/yubikey-agent.service` with contents similar to:
 
-Depending on your distribution (`systemd <=239` or no user namespace support),
-you might need to edit the `ExecStart=` line and some of the sandboxing
-options.
+```ini
+[Unit]
+Description=YubiKey SSH agent
+After=default.target
 
-Refresh systemd, make sure that the PC/SC daemon is available, and start the yubikey-agent.
+[Service]
+Type=simple
+ExecStart=%h/go/bin/yubikey-agent
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Adjust `ExecStart=` for your install path as needed.
+
+Refresh systemd, make sure PC/SC is available, and start the service:
 
 ```text
 $ systemctl daemon-reload --user
@@ -35,8 +43,8 @@ $ sudo systemctl enable --now pcscd.socket
 $ systemctl --user enable --now yubikey-agent
 ```
 
-Finally, add the following line to your shell profile and restart it.
+Finally, add the socket path to your shell profile and restart it:
 
-```
-export SSH_AUTH_SOCK="${XDG_RUNTIME_DIR}/yubikey-agent/yubikey-agent.sock"
+```bash
+export SSH_AUTH_SOCK="${HOME}/.ssh/yubikey-agent.sock"
 ```

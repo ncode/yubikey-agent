@@ -8,6 +8,8 @@ package agent
 
 import (
 	"testing"
+
+	"github.com/go-piv/piv-go/v2/piv"
 )
 
 // TestRandomSerialNumber tests that randomSerialNumber generates valid serial numbers
@@ -65,6 +67,25 @@ func TestSlotConfigs(t *testing.T) {
 			t.Errorf("Duplicate slot found: %x", cfg.slot.Key)
 		}
 		seen[uint32(cfg.slot.Key)] = true
+	}
+}
+
+func TestSlotConfigPolicies(t *testing.T) {
+	expected := map[uint32]piv.PINPolicy{
+		uint32(piv.SlotAuthentication.Key):     piv.PINPolicyOnce,
+		uint32(piv.SlotSignature.Key):          piv.PINPolicyAlways,
+		uint32(piv.SlotKeyManagement.Key):      piv.PINPolicyOnce,
+		uint32(piv.SlotCardAuthentication.Key): piv.PINPolicyNever,
+	}
+
+	for _, cfg := range defaultSlotConfigs {
+		want, ok := expected[uint32(cfg.slot.Key)]
+		if !ok {
+			continue
+		}
+		if cfg.pinPolicy != want {
+			t.Errorf("slot %x pinPolicy = %v, want %v", cfg.slot.Key, cfg.pinPolicy, want)
+		}
 	}
 }
 
