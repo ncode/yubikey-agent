@@ -3,7 +3,7 @@ module github.com/ncode/yubikey-agent
 go 1.25.1
 
 require (
-	github.com/go-piv/piv-go/v2 v2.4.0
+	github.com/go-piv/piv-go/v2 v2.5.0
 	github.com/spf13/cobra v1.10.1
 	github.com/spf13/viper v1.21.0
 	github.com/twpayne/go-pinentry-minimal v0.0.0-20220113210447-2a5dc4396c2a
