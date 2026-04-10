@@ -39,6 +39,11 @@ const (
 	// TouchNotificationTimeout is how long to wait before showing a touch notification
 	TouchNotificationTimeout = 5 * time.Second
 
+	// ListHealthCheckInterval bounds how long cached keys can be served before
+	// re-checking device health. This avoids repeated PC/SC probes on hot list
+	// paths while keeping stale key listings short-lived.
+	ListHealthCheckInterval = time.Second
+
 	// TemporaryErrorRetryDelay is how long to wait before retrying after a temporary error
 	TemporaryErrorRetryDelay = time.Second
 
@@ -239,13 +244,18 @@ type Agent struct {
 	// Instead of a single YubiKey, store all discovered YubiKeys:
 	yks []*Yubi
 
-	keyEntries []keyEntry
-	keyIndex   map[string]int
+	keyEntries      []keyEntry
+	agentKeys       []*agent.Key
+	keyIndex        map[string]int
+	lastHealthCheck time.Time
+	now             func() time.Time
 }
 
 var _ agent.ExtendedAgent = &Agent{}
 
 func (a *Agent) serveConn(c net.Conn) {
+	defer c.Close()
+
 	if err := agent.ServeAgent(a, c); err != io.EOF {
 		log.Println("Agent client connection ended with error:", err)
 	}
@@ -275,6 +285,7 @@ func (a *Agent) ensureYK() error {
 			if a.keyIndex == nil {
 				return a.refreshKeyEntriesLocked()
 			}
+			a.lastHealthCheck = a.currentTime()
 			return nil
 		}
 		// If any device isn't healthy, close and reload them all
@@ -289,6 +300,13 @@ func (a *Agent) ensureYK() error {
 	}
 	a.yks = yks
 	return a.refreshKeyEntriesLocked()
+}
+
+func (a *Agent) ensureCachedKeysForListLocked() error {
+	if len(a.yks) > 0 && a.keyIndex != nil && a.agentKeys != nil && !a.listHealthCheckDueLocked() {
+		return nil
+	}
+	return a.ensureYK()
 }
 
 // Close finishes the connection to the YubiKey devices.
@@ -306,14 +324,14 @@ func (a *Agent) Close() error {
 // List returns a list of all available keys from all YubiKeys.
 func (a *Agent) List() ([]*agent.Key, error) {
 	a.mu.Lock()
-	if err := a.ensureYK(); err != nil {
+	if err := a.ensureCachedKeysForListLocked(); err != nil {
 		a.mu.Unlock()
 		return nil, fmt.Errorf("could not reach YubiKeys: %w", err)
 	}
-	entries := append([]keyEntry(nil), a.keyEntries...)
+	keys := append([]*agent.Key(nil), a.agentKeys...)
 	a.mu.Unlock()
 
-	return agentKeysFromEntries(entries), nil
+	return keys, nil
 }
 
 // getPublicKey retrieves the SSH public key from a specific PIV slot.
@@ -580,11 +598,13 @@ func (a *Agent) refreshKeyEntriesLocked() error {
 	}
 
 	a.setKeyEntriesLocked(entries)
+	a.lastHealthCheck = a.currentTime()
 	return nil
 }
 
 func (a *Agent) setKeyEntriesLocked(entries []keyEntry) {
 	a.keyEntries = entries
+	a.agentKeys = agentKeysFromEntries(entries)
 	a.keyIndex = make(map[string]int, len(entries))
 	for i, entry := range entries {
 		a.keyIndex[string(entry.publicBlob)] = i
@@ -594,7 +614,9 @@ func (a *Agent) setKeyEntriesLocked(entries []keyEntry) {
 func (a *Agent) clearStateLocked() {
 	a.yks = nil
 	a.keyEntries = nil
+	a.agentKeys = nil
 	a.keyIndex = nil
+	a.lastHealthCheck = time.Time{}
 }
 
 func (a *Agent) closeYubiKeysLocked(logFormat string) {
@@ -628,7 +650,22 @@ func (a *Agent) recoverAfterTimeout() {
 	// Timeout recovery therefore closes current handles and forces a reload on
 	// the next request, but it does not guarantee immediate interruption of the
 	// underlying PC/SC call.
+	log.Println("Sign operation timed out; closing cached YubiKey handles. The underlying smart-card call may remain blocked until the OS PC/SC stack releases it.")
 	a.closeYubiKeysLocked("Warning: failed to close YubiKey %s after sign timeout: %v")
+}
+
+func (a *Agent) currentTime() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+	return time.Now()
+}
+
+func (a *Agent) listHealthCheckDueLocked() bool {
+	if a.lastHealthCheck.IsZero() {
+		return true
+	}
+	return a.currentTime().Sub(a.lastHealthCheck) >= ListHealthCheckInterval
 }
 
 func agentKeysFromEntries(entries []keyEntry) []*agent.Key {

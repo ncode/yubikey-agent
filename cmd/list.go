@@ -25,6 +25,14 @@ var listCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		defer func() {
+			for _, yubi := range yubikeys {
+				if yubi == nil || yubi.Device == nil {
+					continue
+				}
+				_ = yubi.Device.Close()
+			}
+		}()
 		for _, yubi := range yubikeys {
 			if viper.GetBool("plain") {
 				fmt.Printf("%s #%d\n", yubi.Name, yubi.Serial)

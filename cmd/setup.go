@@ -25,6 +25,7 @@ var setupCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		defer yk.Device.Close()
 		if reallyDeleteAllPivKeys {
 			fmt.Println("Resetting YubiKey PIV applet...")
 			if err := yk.Device.Reset(); err != nil {
