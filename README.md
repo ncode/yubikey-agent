@@ -64,3 +64,25 @@ If the PUK is also entered incorrectly three times, recovery is not possible wit
 
 - Linux and macOS are supported.
 - Windows support is currently work in progress.
+
+## Signing timeout and cancellation
+
+Signing requests are bounded by a timeout, so the SSH client will eventually get
+an explicit timeout error instead of waiting forever for touch/PIN interaction.
+
+However, a timed out request cannot always hard-cancel the underlying smart-card
+operation. This is a limitation of the YubiKey access stack, not just this
+project:
+
+- `github.com/go-piv/piv-go/v2` does not expose cancellation for an in-flight
+  card operation.
+- The underlying PC/SC call may stay blocked until the OS smart-card stack
+  releases it.
+- `yubikey-agent` can close its cached handles and reconnect on the next
+  request, but it cannot forcibly interrupt a sign operation that is already
+  stuck inside the lower-level stack.
+
+In practice, that means the caller sees a timeout, but the blocked smart-card
+operation may still unwind later in the background. This is expected and
+currently not fixable in-process without a larger architectural change such as
+isolating signing in a separate helper process.

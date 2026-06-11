@@ -7,8 +7,13 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"errors"
+	"net"
 	"testing"
 	"time"
 
@@ -224,19 +229,23 @@ func TestSignWithRetryAndTimeoutContextDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()
 	retries := 100
+	timeoutCalls := 0
 
 	_, err := signWithRetryAndTimeout(
 		ctx,
-		func() ([]ssh.Signer, error) { return nil, nil },
-		func(signers []ssh.Signer) (*ssh.Signature, error) {
+		func() (*ssh.Signature, error) {
 			time.Sleep(time.Millisecond)
 			retries--
 			return nil, &piv.AuthErr{Retries: retries}
 		},
+		func() { timeoutCalls++ },
 	)
 
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("signWithRetryAndTimeout() error = %v, want context deadline exceeded", err)
+	}
+	if timeoutCalls != 1 {
+		t.Fatalf("timeout callback count = %d, want 1", timeoutCalls)
 	}
 }
 
@@ -245,11 +254,11 @@ func TestSignWithRetryAndTimeoutRetryStopsWithoutProgress(t *testing.T) {
 
 	_, err := signWithRetryAndTimeout(
 		context.Background(),
-		func() ([]ssh.Signer, error) { return nil, nil },
-		func(signers []ssh.Signer) (*ssh.Signature, error) {
+		func() (*ssh.Signature, error) {
 			attempts++
 			return nil, &piv.AuthErr{Retries: 2}
 		},
+		nil,
 	)
 
 	if attempts != 2 {
@@ -263,15 +272,16 @@ func TestSignWithRetryAndTimeoutRetryStopsWithoutProgress(t *testing.T) {
 func TestSignWithRetryAndTimeoutReturnsOnContextWhilePerformBlocks(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()
+	timeoutCalls := 0
 
 	errCh := make(chan error, 1)
 	go func() {
 		_, err := signWithRetryAndTimeout(
 			ctx,
-			func() ([]ssh.Signer, error) { return nil, nil },
-			func(signers []ssh.Signer) (*ssh.Signature, error) {
+			func() (*ssh.Signature, error) {
 				select {}
 			},
+			func() { timeoutCalls++ },
 		)
 		errCh <- err
 	}()
@@ -284,4 +294,220 @@ func TestSignWithRetryAndTimeoutReturnsOnContextWhilePerformBlocks(t *testing.T)
 	case <-time.After(100 * time.Millisecond):
 		t.Fatal("signWithRetryAndTimeout() did not return after context deadline")
 	}
+	if timeoutCalls != 1 {
+		t.Fatalf("timeout callback count = %d, want 1", timeoutCalls)
+	}
+}
+
+func TestAgentKeyEntryLookup(t *testing.T) {
+	entry := testKeyEntry(t, "slot-9a")
+	a := &Agent{}
+
+	a.setKeyEntriesLocked([]keyEntry{entry})
+
+	got, ok := a.keyEntryByPublicKeyLocked(entry.publicKey)
+	if !ok {
+		t.Fatal("keyEntryByPublicKeyLocked() did not find cached key")
+	}
+	if got.comment != entry.comment {
+		t.Fatalf("keyEntryByPublicKeyLocked() comment = %q, want %q", got.comment, entry.comment)
+	}
+
+	if _, ok := a.keyEntryByPublicKeyLocked(&mockPublicKey{keyType: ssh.KeyAlgoECDSA256}); ok {
+		t.Fatal("keyEntryByPublicKeyLocked() unexpectedly matched unknown key")
+	}
+}
+
+func TestAgentRecoverAfterTimeoutClearsState(t *testing.T) {
+	a := &Agent{
+		yks:             []*Yubi{{Name: "test-yubikey"}},
+		lastHealthCheck: time.Unix(123, 0),
+	}
+	a.setKeyEntriesLocked([]keyEntry{testKeyEntry(t, "slot-9a")})
+
+	a.recoverAfterTimeout()
+
+	if a.yks != nil {
+		t.Fatal("recoverAfterTimeout() should clear YubiKey handles")
+	}
+	if a.keyEntries != nil {
+		t.Fatal("recoverAfterTimeout() should clear cached key entries")
+	}
+	if a.keyIndex != nil {
+		t.Fatal("recoverAfterTimeout() should clear key index")
+	}
+	if a.agentKeys != nil {
+		t.Fatal("recoverAfterTimeout() should clear cached agent keys")
+	}
+	if !a.lastHealthCheck.IsZero() {
+		t.Fatal("recoverAfterTimeout() should clear last health check timestamp")
+	}
+}
+
+func TestAgentKeysFromEntries(t *testing.T) {
+	entry := testKeyEntry(t, "slot-9a")
+
+	keys := agentKeysFromEntries([]keyEntry{entry})
+	if len(keys) != 1 {
+		t.Fatalf("agentKeysFromEntries() len = %d, want 1", len(keys))
+	}
+	if keys[0].Format != entry.publicKey.Type() {
+		t.Fatalf("agentKeysFromEntries() format = %q, want %q", keys[0].Format, entry.publicKey.Type())
+	}
+	if keys[0].Comment != entry.comment {
+		t.Fatalf("agentKeysFromEntries() comment = %q, want %q", keys[0].Comment, entry.comment)
+	}
+	if string(keys[0].Blob) != string(entry.publicBlob) {
+		t.Fatal("agentKeysFromEntries() blob mismatch")
+	}
+}
+
+func TestServeConnClosesConnection(t *testing.T) {
+	a := &Agent{}
+	conn := &trackingConn{reader: bytes.NewReader(nil)}
+
+	a.serveConn(conn)
+
+	if !conn.closed {
+		t.Fatal("serveConn() should close the client connection")
+	}
+}
+
+func TestAgentListUsesCachedKeysWithinHealthCheckInterval(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	entry := testKeyEntry(t, "slot-9a")
+	a := &Agent{
+		yks:             []*Yubi{{Name: "cached-yubikey"}},
+		lastHealthCheck: now,
+		now: func() time.Time {
+			return now.Add(ListHealthCheckInterval - time.Millisecond)
+		},
+	}
+	a.setKeyEntriesLocked([]keyEntry{entry})
+
+	keys, err := a.List()
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(keys) != 1 {
+		t.Fatalf("List() len = %d, want 1", len(keys))
+	}
+	if keys[0].Comment != entry.comment {
+		t.Fatalf("List() comment = %q, want %q", keys[0].Comment, entry.comment)
+	}
+}
+
+func BenchmarkResolveKeyFromCache(b *testing.B) {
+	entry := testKeyEntry(b, "slot-9a")
+	a := &Agent{}
+	a.setKeyEntriesLocked([]keyEntry{entry})
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if _, ok := a.keyEntryByPublicKeyLocked(entry.publicKey); !ok {
+			b.Fatal("cached key not found")
+		}
+	}
+}
+
+func BenchmarkListCachedKeys(b *testing.B) {
+	entries := []keyEntry{
+		testKeyEntry(b, "slot-9a"),
+		testKeyEntry(b, "slot-9c"),
+		testKeyEntry(b, "slot-9d"),
+		testKeyEntry(b, "slot-9e"),
+	}
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		keys := agentKeysFromEntries(entries)
+		if len(keys) != len(entries) {
+			b.Fatal("unexpected key count")
+		}
+	}
+}
+
+func BenchmarkAgentListFromCache(b *testing.B) {
+	now := time.Unix(1_700_000_000, 0)
+	entries := []keyEntry{
+		testKeyEntry(b, "slot-9a"),
+		testKeyEntry(b, "slot-9c"),
+		testKeyEntry(b, "slot-9d"),
+		testKeyEntry(b, "slot-9e"),
+	}
+	a := &Agent{
+		yks:             []*Yubi{{Name: "cached-yubikey"}},
+		lastHealthCheck: now,
+		now:             func() time.Time { return now },
+	}
+	a.setKeyEntriesLocked(entries)
+
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		keys, err := a.List()
+		if err != nil {
+			b.Fatalf("List() error = %v", err)
+		}
+		if len(keys) != len(entries) {
+			b.Fatal("unexpected key count")
+		}
+	}
+}
+
+func testKeyEntry(tb testing.TB, comment string) keyEntry {
+	tb.Helper()
+
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		tb.Fatalf("GenerateKey() error = %v", err)
+	}
+	publicKey, err := ssh.NewPublicKey(privateKey.Public())
+	if err != nil {
+		tb.Fatalf("NewPublicKey() error = %v", err)
+	}
+
+	return keyEntry{
+		slot:       piv.SlotAuthentication,
+		publicKey:  publicKey,
+		publicBlob: publicKey.Marshal(),
+		comment:    comment,
+	}
+}
+
+type trackingConn struct {
+	reader *bytes.Reader
+	closed bool
+}
+
+func (c *trackingConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+func (c *trackingConn) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+
+func (c *trackingConn) Close() error {
+	c.closed = true
+	return nil
+}
+
+func (c *trackingConn) LocalAddr() net.Addr {
+	return &net.UnixAddr{Name: "local", Net: "unix"}
+}
+
+func (c *trackingConn) RemoteAddr() net.Addr {
+	return &net.UnixAddr{Name: "remote", Net: "unix"}
+}
+
+func (c *trackingConn) SetDeadline(time.Time) error {
+	return nil
+}
+
+func (c *trackingConn) SetReadDeadline(time.Time) error {
+	return nil
+}
+
+func (c *trackingConn) SetWriteDeadline(time.Time) error {
+	return nil
 }

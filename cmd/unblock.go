@@ -20,6 +20,7 @@ var unblockCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		defer yk.Device.Close()
 
 		err = agent.UnblockPIN(yk.Device)
 		if err != nil {
