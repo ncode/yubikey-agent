@@ -7,10 +7,189 @@
 package agent
 
 import (
+	"bytes"
+	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/go-piv/piv-go/v2/piv"
+	"github.com/spf13/viper"
 )
+
+type setupTestDevice struct {
+	*piv.YubiKey
+	certs     map[piv.Slot]bool
+	keys      map[piv.Slot]bool
+	probeErr  error
+	version   piv.Version
+	mutations int
+}
+
+type incrementalTestDevice struct {
+	setupTestDevice
+	metadata          *piv.Metadata
+	metadataErr       error
+	metadataPIN       string
+	public            crypto.PublicKey
+	generatedKey      []byte
+	storedCertificate bool
+}
+
+func (d *incrementalTestDevice) Metadata(pin string) (*piv.Metadata, error) {
+	d.metadataPIN = pin
+	return d.metadata, d.metadataErr
+}
+func (d *incrementalTestDevice) GenerateKey(key []byte, _ piv.Slot, _ piv.Key) (crypto.PublicKey, error) {
+	d.generatedKey = key
+	return d.public, nil
+}
+func (d *incrementalTestDevice) SetCertificate(_ []byte, _ piv.Slot, _ *x509.Certificate) error {
+	d.storedCertificate = true
+	return nil
+}
+
+func TestSetupSlotUsesCurrentPINForMetadata(t *testing.T) {
+	key := bytes.Repeat([]byte{1}, 24)
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := &incrementalTestDevice{metadata: &piv.Metadata{ManagementKey: &key}, public: &priv.PublicKey}
+	prompted := false
+	err = setupSlot(d, piv.SlotAuthentication, piv.PINPolicyOnce, piv.TouchPolicyAlways,
+		func() (string, error) { prompted = true; return "87654321", nil },
+		func() ([]byte, error) {
+			t.Error("prompted to reset a configured device")
+			return nil, errors.New("unexpected new PIN")
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !prompted || d.metadataPIN != "87654321" {
+		t.Errorf("prompted = %v, metadata PIN = %q", prompted, d.metadataPIN)
+	}
+	if !bytes.Equal(d.generatedKey, key) || !d.storedCertificate || d.mutations != 0 {
+		t.Error("did not reuse the stored management key without changing credentials")
+	}
+}
+
+func TestSetupSlotDoesNotReinitializeOnMetadataError(t *testing.T) {
+	sentinel := errors.New("incorrect PIN")
+	d := &incrementalTestDevice{metadataErr: sentinel}
+	prompted := false
+	err := setupSlot(d, piv.SlotAuthentication, piv.PINPolicyOnce, piv.TouchPolicyAlways,
+		func() (string, error) { return "87654321", nil },
+		func() ([]byte, error) { prompted = true; return nil, errors.New("unexpected new PIN") })
+	if !errors.Is(err, sentinel) || prompted || d.mutations != 0 {
+		t.Errorf("error = %v, new PIN prompted = %v, mutations = %d", err, prompted, d.mutations)
+	}
+}
+
+func (d *setupTestDevice) Certificate(s piv.Slot) (*x509.Certificate, error) {
+	if d.certs[s] {
+		return &x509.Certificate{}, nil
+	}
+	return nil, piv.ErrNotFound
+}
+func (d *setupTestDevice) KeyInfo(s piv.Slot) (piv.KeyInfo, error) {
+	if d.probeErr != nil {
+		return piv.KeyInfo{}, d.probeErr
+	}
+	if d.keys[s] {
+		return piv.KeyInfo{Algorithm: piv.AlgorithmEC256}, nil
+	}
+	return piv.KeyInfo{}, piv.ErrNotFound
+}
+func (d *setupTestDevice) Version() piv.Version { return d.version }
+func (d *setupTestDevice) SetManagementKey(_, _ []byte) error {
+	d.mutations++
+	return errors.New("stop before mutation")
+}
+
+func TestSetupPreservesExistingSlots(t *testing.T) {
+	for _, slot := range enabledSlots {
+		for _, certificate := range []bool{true, false} {
+			t.Run(fmt.Sprintf("slot_%x/certificate_%v", slot.Key, certificate), func(t *testing.T) {
+				d := &setupTestDevice{certs: map[piv.Slot]bool{slot: certificate}, keys: map[piv.Slot]bool{slot: true}, version: piv.Version{Major: 5, Minor: 3}}
+				prompted := false
+				err := runSetup(d, func() ([]byte, error) { prompted = true; return nil, errors.New("unexpected PIN prompt") }, false)
+				if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("%x", slot.Key)) {
+					t.Errorf("error = %v, want occupied slot %x", err, slot.Key)
+				}
+				if prompted || d.mutations != 0 {
+					t.Errorf("prompted = %v, mutations = %d before detecting existing key", prompted, d.mutations)
+				}
+			})
+		}
+	}
+}
+
+func TestSetupFailsClosedWhenSlotInspectionFails(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version piv.Version
+		err     error
+	}{
+		{"reader error", piv.Version{Major: 5, Minor: 3}, errors.New("reader disconnected")},
+		{"older firmware", piv.Version{Major: 4, Minor: 3}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &setupTestDevice{version: tc.version, probeErr: tc.err}
+			prompted := false
+			err := runSetup(d, func() ([]byte, error) { prompted = true; return nil, errors.New("unexpected PIN prompt") }, false)
+			if err == nil || prompted || d.mutations != 0 {
+				t.Errorf("error = %v, prompted = %v, mutations = %d", err, prompted, d.mutations)
+			}
+		})
+	}
+}
+
+func TestGetSingleYubiKeyClosesRejectedDevices(t *testing.T) {
+	viper.Set("serial", uint32(0))
+	defer viper.Set("serial", nil)
+	source := &testYubiSource{cards: []string{"A", "B"}, devices: map[string]*Yubi{"A": {Name: "A"}, "B": {Name: "B"}}}
+	if _, err := getSingleYubiKeyContext(context.Background(), source); err == nil {
+		t.Fatal("accepted multiple devices")
+	}
+	if len(source.closed) != 2 {
+		t.Fatalf("closed %v, want both devices", source.closed)
+	}
+}
+
+func TestSetupSlotMissingMetadataDoesNotChangeCustomCredentials(t *testing.T) {
+	d := &incrementalTestDevice{metadata: &piv.Metadata{}}
+	prompted := false
+	err := setupSlot(d, piv.SlotAuthentication, piv.PINPolicyOnce, piv.TouchPolicyAlways,
+		func() (string, error) { return "87654321", nil },
+		func() ([]byte, error) { prompted = true; return []byte("12345678"), nil })
+	if err == nil || prompted || d.mutations != 0 {
+		t.Fatalf("error = %v, prompted = %v, mutations = %d", err, prompted, d.mutations)
+	}
+}
+
+func TestSetupEmptyDeviceReachesPINPrompt(t *testing.T) {
+	for _, reset := range []bool{false, true} {
+		t.Run(fmt.Sprintf("explicitly_reset_%v", reset), func(t *testing.T) {
+			version := piv.Version{Major: 5, Minor: 3}
+			if reset {
+				version = piv.Version{Major: 4, Minor: 3}
+			}
+			d := &setupTestDevice{version: version}
+			stopped := errors.New("stop before provisioning")
+			err := runSetup(d, func() ([]byte, error) { return nil, stopped }, reset)
+			if !errors.Is(err, stopped) || d.mutations != 0 {
+				t.Fatalf("error = %v, mutations = %d", err, d.mutations)
+			}
+		})
+	}
+}
 
 // TestRandomSerialNumber tests that randomSerialNumber generates valid serial numbers
 func TestRandomSerialNumber(t *testing.T) {

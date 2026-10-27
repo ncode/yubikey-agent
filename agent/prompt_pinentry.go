@@ -10,22 +10,26 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/twpayne/go-pinentry-minimal/pinentry"
 )
 
-func getPIN(serial uint32, retries int) (string, error) {
+func getPIN(ctx context.Context, serial uint32, retries int) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	client, err := pinentry.NewClient(
+		pinentry.WithProcess(&pinentryProcess{ctx: ctx}),
 		pinentry.WithBinaryNameFromGnuPGAgentConf(),
 		pinentry.WithGPGTTY(),
 		pinentry.WithTitle("yubikey-agent PIN Prompt"),
 		pinentry.WithDesc(fmt.Sprintf("YubiKey serial number: %d (%d tries remaining)", serial, retries)),
 		pinentry.WithPrompt("Please enter your PIN:"),
-		// Enable opt-in external PIN caching (in the OS keychain).
-		// https://gist.github.com/mdeguzis/05d1f284f931223624834788da045c65#file-info-pinentry-L324
-		pinentry.WithOption(pinentry.OptionAllowExternalPasswordCache),
-		pinentry.WithKeyInfo(fmt.Sprintf("--yubikey-id-%d", serial)),
+		// Do not enable an external password cache: a stale cached PIN would
+		// otherwise consume hardware retries without fresh user input. PIN-once
+		// caching remains the responsibility of the YubiKey's PIV session.
 	)
 	if err != nil {
 		return "", err

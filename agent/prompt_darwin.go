@@ -9,6 +9,7 @@ package agent
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -30,7 +31,10 @@ app.displayDialog(
     hiddenAnswer: true,
 })`))
 
-func getPIN(serial uint32, retries int) (string, error) {
+func getPIN(ctx context.Context, serial uint32, retries int) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	script := new(bytes.Buffer)
 	if err := scriptTemplate.Execute(script, map[string]interface{}{
 		"Serial": serial, "Tries": retries,
@@ -38,11 +42,14 @@ func getPIN(serial uint32, retries int) (string, error) {
 		return "", err
 	}
 
-	c := exec.Command("osascript", "-s", "se", "-l", "JavaScript")
+	c := exec.CommandContext(ctx, "osascript", "-s", "se", "-l", "JavaScript")
 	c.Stdin = script
 	out, err := c.Output()
 	if err != nil {
-		return "", fmt.Errorf("failed to execute osascript: %v", err)
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return "", fmt.Errorf("failed to execute osascript: %w", err)
 	}
 	var x struct {
 		PIN string `json:"textReturned"`

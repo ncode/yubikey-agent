@@ -7,10 +7,12 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"runtime/debug"
+	"strconv"
 
 	"github.com/ncode/yubikey-agent/agent"
 	"github.com/spf13/cobra"
@@ -26,6 +28,9 @@ var cfgFile string
 var rootCmd = &cobra.Command{
 	Use:   "yubikey-agent",
 	Short: "yubikey-agent is a seamless ssh-agent for YubiKeys.",
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		return initConfig()
+	},
 	Run: func(cmd *cobra.Command, args []string) {
 		agent.Run()
 	},
@@ -43,7 +48,6 @@ func Execute() {
 var homeDir string
 
 func init() {
-	cobra.OnInitialize(initConfig)
 	var err error
 	homeDir, err = os.UserHomeDir()
 	if err != nil {
@@ -66,7 +70,7 @@ func init() {
 }
 
 // initConfig reads in config file and ENV variables if set.
-func initConfig() {
+func initConfig() error {
 	if cfgFile != "" {
 		// Use config file from the flag.
 		viper.SetConfigFile(cfgFile)
@@ -78,6 +82,17 @@ func initConfig() {
 
 	viper.AutomaticEnv() // read in environment variables that match
 
-	// If a config file is found, read it in silently (ignore errors)
-	_ = viper.ReadInConfig()
+	if err := viper.ReadInConfig(); err != nil {
+		var missing viper.ConfigFileNotFoundError
+		if cfgFile != "" || !errors.As(err, &missing) {
+			return fmt.Errorf("read configuration: %w", err)
+		}
+		// The default file is optional; flags and environment still need validation.
+	}
+	if viper.IsSet("serial") {
+		if _, err := strconv.ParseUint(viper.GetString("serial"), 0, 32); err != nil {
+			return fmt.Errorf("invalid serial: expected an unsigned 32-bit integer: %w", err)
+		}
+	}
+	return nil
 }

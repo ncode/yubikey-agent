@@ -27,10 +27,7 @@ var listCmd = &cobra.Command{
 		}
 		defer func() {
 			for _, yubi := range yubikeys {
-				if yubi == nil || yubi.Device == nil {
-					continue
-				}
-				_ = yubi.Device.Close()
+				_ = yubi.Device.Close() // Release every device after listing.
 			}
 		}()
 		for _, yubi := range yubikeys {

@@ -8,8 +8,13 @@ package cmd
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 )
 
 // TestRootCommand tests the root command structure
@@ -109,6 +114,11 @@ func TestRootCommandFlags(t *testing.T) {
 
 // TestHelpOutput tests that help output contains expected information
 func TestHelpOutput(t *testing.T) {
+	t.Cleanup(func() {
+		rootCmd.SetOut(nil)
+		rootCmd.SetArgs(nil)
+		_ = rootCmd.Flags().Set("help", "false")
+	})
 	buf := new(bytes.Buffer)
 	rootCmd.SetOut(buf)
 	rootCmd.SetArgs([]string{"--help"})
@@ -130,6 +140,86 @@ func TestHelpOutput(t *testing.T) {
 		if !strings.Contains(output, s) {
 			t.Errorf("Help output should contain %q", s)
 		}
+	}
+}
+
+func TestConfigValidationBeforeHandler(t *testing.T) {
+	originalRun := rootCmd.Run
+	originalHome := homeDir
+	serialFlag := rootCmd.PersistentFlags().Lookup("serial")
+	originalSerial, originalSerialChanged := serialFlag.Value.String(), serialFlag.Changed
+	t.Cleanup(func() {
+		rootCmd.Run = originalRun
+		homeDir = originalHome
+		cfgFile = ""
+		_ = serialFlag.Value.Set(originalSerial)
+		serialFlag.Changed = originalSerialChanged
+		rootCmd.SetArgs(nil)
+		rootCmd.SetOut(nil)
+		rootCmd.SetErr(nil)
+		viper.Reset()
+		_ = viper.BindPFlag("serial", rootCmd.PersistentFlags().Lookup("serial"))
+		_ = viper.BindPFlag("listen", rootCmd.PersistentFlags().Lookup("listen"))
+		_ = viper.BindPFlag("plain", listCmd.Flags().Lookup("plain"))
+	})
+	for _, tc := range []struct {
+		name, contents              string
+		explicit, exists, wantError bool
+		serialEnv, serialArg        string
+		wantSerial                  uint32
+	}{
+		{name: "explicit missing", explicit: true, wantError: true},
+		{name: "explicit malformed", explicit: true, exists: true, contents: "serial: [", wantError: true},
+		{name: "discovered malformed", exists: true, contents: "serial: [", wantError: true},
+		{name: "invalid serial", explicit: true, exists: true, contents: "serial: not-a-number\n", wantError: true},
+		{name: "negative serial", explicit: true, exists: true, contents: "serial: -1\n", wantError: true},
+		{name: "serial overflow", explicit: true, exists: true, contents: "serial: 4294967296\n", wantError: true},
+		{name: "optional missing"},
+		{name: "valid", explicit: true, exists: true, contents: "serial: 123456\n", wantSerial: 123456},
+		{name: "maximum serial", explicit: true, exists: true, contents: "serial: 4294967295\n", wantSerial: 4294967295},
+		{name: "invalid serial environment", serialEnv: "not-a-number", wantError: true},
+		{name: "valid serial environment", serialEnv: "42", wantSerial: 42},
+		{name: "serial flag overrides invalid config", explicit: true, exists: true, contents: "serial: not-a-number\n", serialArg: "42", wantSerial: 42},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			viper.Reset()
+			_ = serialFlag.Value.Set("0")
+			serialFlag.Changed = false
+			if err := viper.BindPFlag("serial", serialFlag); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("SERIAL", tc.serialEnv)
+			homeDir = t.TempDir()
+			path := filepath.Join(homeDir, ".yubikey-agent.yaml")
+			if tc.exists {
+				if err := os.WriteFile(path, []byte(tc.contents), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfgFile = ""
+			args := []string{}
+			if tc.explicit {
+				args = []string{"--config", path}
+			}
+			if tc.serialArg != "" {
+				args = append(args, "--serial", tc.serialArg)
+			}
+			called := false
+			rootCmd.Run = func(_ *cobra.Command, _ []string) { called = true }
+			rootCmd.SetArgs(args)
+			rootCmd.SetOut(new(bytes.Buffer))
+			rootCmd.SetErr(new(bytes.Buffer))
+			err := rootCmd.Execute()
+			if (err != nil) != tc.wantError {
+				t.Errorf("error = %v, wantError %v", err, tc.wantError)
+			}
+			if called == tc.wantError {
+				t.Errorf("handler called = %v, want %v", called, !tc.wantError)
+			}
+			if !tc.wantError && viper.GetUint32("serial") != tc.wantSerial {
+				t.Fatalf("effective serial = %d, want %d", viper.GetUint32("serial"), tc.wantSerial)
+			}
+		})
 	}
 }
 
