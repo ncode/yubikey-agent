@@ -46,6 +46,51 @@ yubikey-agent setup    # Configure a YubiKey PIV applet for SSH
 yubikey-agent unblock  # Unblock/reset a locked PIN using the PUK
 ```
 
+Setup checks all four target slots before changing credentials or generating
+keys, including private keys that have no stored certificate. If any target
+slot is occupied, setup stops. Firmware older than 5.3 cannot reliably report
+certificate-less keys, so setup on those devices requires the explicit
+`--really-delete-all-piv-keys` flag. That flag wipes the entire PIV applet,
+including keys outside the four SSH slots.
+
+An explicit `--config` file must exist and parse successfully. A malformed
+configuration stops the command before it accesses devices. The default
+configuration file is optional.
+
+## Signing and device recovery
+
+Signing requests have a two-minute deadline, including discovery, signer
+preparation, and waiting for another request. Software PIN dialogs can be
+canceled when their request ends. External pinentry password caches are
+disabled so a stale cached PIN cannot silently exhaust hardware retries.
+The YubiKey's PIN-once session behavior is preserved. Once PIN verification
+has been submitted to the YubiKey, that hardware operation cannot be canceled
+through the PIV API; the agent must wait for the hardware to return. Incorrect
+PINs can be retried
+while the device reports decreasing remaining attempts.
+
+The two-minute deadline bounds the caller's wait; it does not interrupt
+hardware PIN verification or an in-flight PC/SC signing/touch operation. If a
+card call outlives the deadline, the caller receives a timeout, but the agent
+retains exclusive use of the device until that call returns. It then releases
+the cached handles before the next request reconnects. SIGHUP also releases
+cached handles once outstanding device work finishes. If the OS smart-card
+stack never releases a blocked call, recovery may require restarting the agent, reconnecting the
+YubiKey, or restarting the OS smart-card service.
+
+Public keys and slot metadata are cached for each connected device session.
+Signing prepares only the requested slot, and validates reader connections
+before using the device. Healthy connections stay open, preserving PIN-once
+sessions. Reconnecting a device or sending SIGHUP refreshes its slot metadata.
+
+Key listings check for reader changes at most once per second while idle.
+While hardware is busy, listings return the last cached public keys without
+waiting for PIN verification or touch. That snapshot may temporarily include
+a disconnected device or omit a newly attached one; the next idle refresh or
+signing request reconciles the readers. An initial listing without a cached
+snapshot has a two-minute caller deadline and follows the same hardware
+ownership rules as signing.
+
 ## Unblocking the PIN with the PUK
 
 If the PIN is entered incorrectly three times, it becomes blocked.

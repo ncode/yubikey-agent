@@ -24,6 +24,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -46,9 +47,13 @@ const (
 	// SocketDirPermissions is the permission mode for the socket directory
 	SocketDirPermissions = 0700
 
-	// SignOperationTimeout is the maximum time allowed for a sign operation
-	// This prevents indefinite blocking waiting for YubiKey touch
+	// SignOperationTimeout bounds the caller's wait. Hardware PIN verification
+	// and PC/SC signing calls cannot be cancelled once submitted; their worker
+	// retains exclusive device ownership until the hardware returns.
 	SignOperationTimeout = 2 * time.Minute
+
+	// ListHealthCheckInterval bounds how often idle listings probe readers.
+	ListHealthCheckInterval = time.Second
 )
 
 // enabledSlots lists all PIV slots that yubikey-agent will use for SSH keys.
@@ -67,6 +72,45 @@ type Yubi struct {
 	Serial uint32
 }
 
+type yubiKeySource interface {
+	Cards() ([]string, error)
+	Open(string, uint32) (*Yubi, error)
+	Healthy(*Yubi) bool
+	Close(*Yubi) error
+	PublicKey(*Yubi, piv.Slot) (ssh.PublicKey, error)
+	Signer(*Yubi, piv.Slot, ssh.PublicKey, func() (string, error)) (ssh.Signer, error)
+}
+
+type pivSource struct{}
+
+func (pivSource) Cards() ([]string, error)                       { return piv.Cards() }
+func (pivSource) Open(card string, serial uint32) (*Yubi, error) { return tryOpenYubiKey(card, serial) }
+func (pivSource) Healthy(yk *Yubi) bool                          { return yk.healthy() }
+func (pivSource) Close(yk *Yubi) error                           { return yk.Device.Close() }
+
+func (pivSource) PublicKey(yk *Yubi, slot piv.Slot) (ssh.PublicKey, error) {
+	return getPublicKey(yk.Device, slot)
+}
+
+func (pivSource) Signer(yk *Yubi, slot piv.Slot, public ssh.PublicKey, prompt func() (string, error)) (ssh.Signer, error) {
+	cryptoPublic, ok := public.(ssh.CryptoPublicKey)
+	if !ok {
+		return nil, fmt.Errorf("unsupported public key type: %T", public)
+	}
+	private, err := yk.Device.PrivateKey(slot, cryptoPublic.CryptoPublicKey(), piv.KeyAuth{PINPrompt: prompt})
+	if err != nil {
+		return nil, err
+	}
+	return ssh.NewSignerFromKey(private)
+}
+
+func (a *Agent) source() yubiKeySource {
+	if a.cardSource != nil {
+		return a.cardSource
+	}
+	return pivSource{}
+}
+
 // LoadYubiKeys loads all connected YubiKeys, but if a `--serial` is provided,
 // only the matching YubiKey will be returned. This ensures we never "touch"
 // any other YubiKeys if `serial` is set.
@@ -77,59 +121,86 @@ func LoadYubiKeys() ([]*Yubi, error) {
 // LoadYubiKeysContext loads all connected YubiKeys with context support.
 // If ctx is cancelled during loading, it returns ctx.Err().
 func LoadYubiKeysContext(ctx context.Context) ([]*Yubi, error) {
-	// Check context before starting
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
+	return loadYubiKeysContext(ctx, pivSource{})
+}
 
-	cards, err := piv.Cards()
+func loadYubiKeysContext(ctx context.Context, source yubiKeySource) ([]*Yubi, error) {
+	yks, err := refreshYubiKeys(ctx, source, nil)
 	if err != nil {
+		for _, yk := range yks {
+			_ = source.Close(yk) // No handles are returned on failure.
+		}
 		return nil, err
 	}
-	if len(cards) == 0 {
-		return nil, errors.New("no smart card detected")
+	return yks, nil
+}
+
+// refreshYubiKeys reconciles readers without reopening healthy cached devices.
+// Even on error, the returned slice owns all handles that remain open.
+func refreshYubiKeys(ctx context.Context, source yubiKeySource, yks []*Yubi) ([]*Yubi, error) {
+	if err := ctx.Err(); err != nil {
+		return yks, err
 	}
-
-	serial := viper.GetUint32("serial")
-	var yubikeys []*Yubi
-
+	cards, err := source.Cards()
+	if err != nil {
+		return yks, err
+	}
+	present := make(map[string]bool, len(cards))
 	for _, card := range cards {
-		// Check context before each card
+		present[card] = true
+	}
+	serial := viper.GetUint32("serial")
+	for i := 0; i < len(yks); {
 		if err := ctx.Err(); err != nil {
-			// Clean up any already-opened devices
-			for _, yk := range yubikeys {
-				_ = yk.Device.Close()
-			}
-			return nil, err
+			return yks, err
 		}
-
-		yk, err := tryOpenYubiKey(card, serial)
+		yk := yks[i]
+		if present[yk.Name] && (serial == 0 || yk.Serial == serial) && source.Healthy(yk) {
+			i++
+			continue
+		}
+		if err := source.Close(yk); err != nil {
+			log.Printf("Warning: failed to close YubiKey %s: %v", yk.Name, err)
+		}
+		yks = append(yks[:i], yks[i+1:]...)
+	}
+	cached := make(map[string]bool, len(yks))
+	for _, yk := range yks {
+		cached[yk.Name] = true
+	}
+	for _, card := range cards {
+		if err := ctx.Err(); err != nil {
+			return yks, err
+		}
+		if serial != 0 && len(yks) > 0 {
+			break
+		}
+		if cached[card] {
+			continue
+		}
+		yk, err := source.Open(card, serial)
 		if err != nil {
-			// Log and skip this card
 			log.Printf("Skipping card %s: %v", card, err)
 			continue
 		}
-		if yk == nil {
-			// This card was filtered out (wrong serial), already closed
-			continue
-		}
-
-		yubikeys = append(yubikeys, yk)
-
-		// If we were looking for a specific serial, we can stop early after finding it.
-		if serial != 0 {
-			break
+		if yk != nil {
+			yks = append(yks, yk)
+			cached[card] = true
 		}
 	}
-
-	// If we have none, return an appropriate error message.
-	if len(yubikeys) == 0 {
-		if serial != 0 {
-			return nil, fmt.Errorf("unable to find YubiKey with serial #%d", serial)
-		}
-		return nil, errors.New("unable to connect to any YubiKey device")
+	if err := ctx.Err(); err != nil {
+		return yks, err
 	}
-	return yubikeys, nil
+	if len(yks) == 0 {
+		if serial != 0 {
+			return yks, fmt.Errorf("unable to find YubiKey with serial #%d", serial)
+		}
+		if len(cards) == 0 {
+			return yks, errors.New("no smart card detected")
+		}
+		return yks, errors.New("unable to connect to any YubiKey device")
+	}
+	return yks, nil
 }
 
 // tryOpenYubiKey attempts to open and validate a single YubiKey card.
@@ -227,10 +298,24 @@ func Run() {
 // Agent holds status of the current agent in use and
 // all yubikeys associated with it
 type Agent struct {
+	// mu protects devices and remains held across uncancellable card calls.
 	mu sync.RWMutex
+	// cacheMu protects the published public-key snapshot; never held during I/O.
+	cacheMu         sync.RWMutex
+	keyEntries      []keyEntry
+	agentKeys       []*agent.Key
+	keyIndex        map[string]int
+	lastHealthCheck time.Time
+
+	// At most one device worker may wait for or own mu. A timed-out card
+	// call retains ownership until it returns; later callers wait on the gate
+	// with their own deadlines instead of starting more blocked workers.
+	operationOnce sync.Once
+	operationGate chan struct{}
 
 	// Instead of a single YubiKey, store all discovered YubiKeys:
-	yks []*Yubi
+	yks        []*Yubi
+	cardSource yubiKeySource
 
 	// touchNotification is armed by Sign to show a notification if waiting for
 	// more than a few seconds for the touch operation. It is paused and reset
@@ -238,9 +323,18 @@ type Agent struct {
 	touchNotification *time.Timer
 }
 
+type keyEntry struct {
+	yubi       *Yubi
+	slot       piv.Slot
+	publicKey  ssh.PublicKey
+	publicBlob []byte
+	comment    string
+}
+
 var _ agent.ExtendedAgent = &Agent{}
 
 func (a *Agent) serveConn(c net.Conn) {
+	defer c.Close()
 	if err := agent.ServeAgent(a, c); err != io.EOF {
 		log.Println("Agent client connection ended with error:", err)
 	}
@@ -257,51 +351,116 @@ func (y *Yubi) healthy() bool {
 // ensureYK checks if we still have healthy connections to our YubiKeys,
 // and reconnects if necessary.
 func (a *Agent) ensureYK() error {
-	// If we have at least one YubiKey, check if they're all healthy:
-	if len(a.yks) > 0 {
-		allHealthy := true
-		for _, yk := range a.yks {
-			if !yk.healthy() {
-				allHealthy = false
-				break
-			}
-		}
-		if allHealthy {
-			return nil
-		}
-		// If any device isn't healthy, close and reload them all
-		for _, yk := range a.yks {
-			if err := yk.Device.Close(); err != nil {
-				log.Printf("Warning: failed to close unhealthy YubiKey %s: %v", yk.Name, err)
-			}
-		}
-		a.yks = nil
-		log.Println("Reconnecting to the YubiKeys...")
-	}
+	return a.ensureYKContext(context.Background())
+}
 
-	// (Re)load
-	yks, err := LoadYubiKeys()
+func (a *Agent) ensureYKContext(ctx context.Context) error {
+	previous := slices.Clone(a.yks)
+	yks, err := refreshYubiKeys(ctx, a.source(), a.yks)
+	a.yks = yks
 	if err != nil {
+		a.invalidateKeyCache()
 		return err
 	}
-	a.yks = yks
+	a.cacheMu.RLock()
+	ready := a.keyIndex != nil
+	a.cacheMu.RUnlock()
+	if !ready || !slices.Equal(previous, yks) {
+		var entries []keyEntry
+		for _, yk := range yks {
+			for _, slot := range enabledSlots {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				public, err := a.source().PublicKey(yk, slot)
+				if err != nil {
+					if errors.Is(err, piv.ErrNotFound) || errors.Is(err, errUnsupportedPublicKey) {
+						continue
+					}
+					// A transient read failure must not become a session-long
+					// missing key, or leave entries pointing to replaced handles.
+					a.invalidateKeyCache()
+					return fmt.Errorf("read public key in slot %x: %w", slot.Key, err)
+				}
+				entries = append(entries, keyEntry{
+					yubi: yk, slot: slot, publicKey: public, publicBlob: public.Marshal(),
+					comment: fmt.Sprintf("%s #%d PIV Slot %x", yk.Name, yk.Serial, slot.Key),
+				})
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		keys := make([]*agent.Key, 0, len(entries))
+		index := make(map[string]int, len(entries))
+		for i, entry := range entries {
+			keys = append(keys, &agent.Key{Format: entry.publicKey.Type(), Blob: entry.publicBlob, Comment: entry.comment})
+			// Keep the first matching slot, as the previous linear search did.
+			if _, exists := index[string(entry.publicBlob)]; !exists {
+				index[string(entry.publicBlob)] = i
+			}
+		}
+		a.cacheMu.Lock()
+		a.keyEntries, a.agentKeys, a.keyIndex = entries, keys, index
+		a.lastHealthCheck = time.Now()
+		a.cacheMu.Unlock()
+	} else {
+		a.cacheMu.Lock()
+		a.lastHealthCheck = time.Now()
+		a.cacheMu.Unlock()
+	}
 	return nil
 }
 
-// Close finishes the connection to the YubiKey devices.
-func (a *Agent) Close() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+func (a *Agent) invalidateKeyCache() {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+	a.keyEntries, a.agentKeys, a.keyIndex = nil, nil, nil
+	a.lastHealthCheck = time.Time{}
+}
 
+// cachedKeys returns caller-owned copies; public blobs and entries stay private.
+func (a *Agent) cachedKeys() (keys []*agent.Key, ready, fresh bool) {
+	a.cacheMu.RLock()
+	defer a.cacheMu.RUnlock()
+	if a.keyIndex == nil {
+		return nil, false, false
+	}
+	keys = make([]*agent.Key, len(a.agentKeys))
+	for i, key := range a.agentKeys {
+		copy := *key
+		copy.Blob = bytes.Clone(key.Blob)
+		keys[i] = &copy
+	}
+	return keys, true, time.Since(a.lastHealthCheck) < ListHealthCheckInterval
+}
+
+// resolveKey is only used with device ownership, so its handle stays valid.
+func (a *Agent) resolveKey(public ssh.PublicKey) (keyEntry, error) {
+	a.cacheMu.RLock()
+	defer a.cacheMu.RUnlock()
+	if i, ok := a.keyIndex[string(public.Marshal())]; ok {
+		return a.keyEntries[i], nil
+	}
+	return keyEntry{}, fmt.Errorf("no private keys match the requested public key")
+}
+
+// Close waits for outstanding hardware work, then closes the YubiKey devices.
+func (a *Agent) Close() error {
+	return a.runDeviceOperation(context.Background(), a.closeYubiKeys, true)
+}
+
+func (a *Agent) closeYubiKeys() error {
+	a.invalidateKeyCache()
 	// Stop any pending touch notification
 	if a.touchNotification != nil {
 		a.touchNotification.Stop()
 	}
 
 	if len(a.yks) > 0 {
-		log.Println("Received SIGHUP, dropping YubiKey transaction(s)...")
+		log.Println("Dropping YubiKey transaction(s)...")
 		for _, yk := range a.yks {
-			if err := yk.Device.Close(); err != nil {
+			if err := a.source().Close(yk); err != nil {
 				log.Printf("Warning: failed to close YubiKey %s: %v", yk.Name, err)
 			}
 		}
@@ -312,29 +471,25 @@ func (a *Agent) Close() error {
 
 // List returns a list of all available keys from all YubiKeys.
 func (a *Agent) List() ([]*agent.Key, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.ensureYK(); err != nil {
+	keys, ready, fresh := a.cachedKeys()
+	if fresh {
+		return keys, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), SignOperationTimeout)
+	defer cancel()
+	err := a.runDeviceOperation(ctx, func() error { return a.ensureYKContext(ctx) }, !ready)
+	if errors.Is(err, errDeviceBusy) {
+		// Public data stays useful while a PIN/touch/card call owns the device.
+		return keys, nil
+	}
+	if err != nil {
 		return nil, fmt.Errorf("could not reach YubiKeys: %w", err)
 	}
-
-	var keys []*agent.Key
-	for _, yk := range a.yks {
-		for _, slot := range enabledSlots {
-			pk, err := getPublicKey(yk.Device, slot)
-			if err != nil {
-				continue
-			}
-			k := &agent.Key{
-				Format:  pk.Type(),
-				Blob:    pk.Marshal(),
-				Comment: fmt.Sprintf("%s #%d PIV Slot %x", yk.Name, yk.Serial, slot.Key),
-			}
-			keys = append(keys, k)
-		}
-	}
+	keys, _, _ = a.cachedKeys()
 	return keys, nil
 }
+
+var errUnsupportedPublicKey = errors.New("unsupported public key type")
 
 // getPublicKey retrieves the SSH public key from a specific PIV slot.
 func getPublicKey(yk *piv.YubiKey, slot piv.Slot) (ssh.PublicKey, error) {
@@ -346,7 +501,7 @@ func getPublicKey(yk *piv.YubiKey, slot piv.Slot) (ssh.PublicKey, error) {
 	case *ecdsa.PublicKey:
 	case *rsa.PublicKey:
 	default:
-		return nil, fmt.Errorf("unexpected public key type: %T", cert.PublicKey)
+		return nil, fmt.Errorf("%w: %T", errUnsupportedPublicKey, cert.PublicKey)
 	}
 	pk, err := ssh.NewPublicKey(cert.PublicKey)
 	if err != nil {
@@ -356,56 +511,59 @@ func getPublicKey(yk *piv.YubiKey, slot piv.Slot) (ssh.PublicKey, error) {
 }
 
 // Signers implements the agent.ExtendedAgent interface, returning signers for all keys.
-// This method locks the agent and ensures YubiKey connections are healthy.
+// Returned signers route operations through the agent so hardware ownership,
+// deadlines, and reconnection also apply to in-process SSH clients.
 func (a *Agent) Signers() ([]ssh.Signer, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.ensureYK(); err != nil {
-		return nil, fmt.Errorf("could not reach YubiKeys: %w", err)
+	keys, err := a.List()
+	if err != nil {
+		return nil, err
 	}
-
-	return a.signers()
+	signers := make([]ssh.Signer, 0, len(keys))
+	for _, key := range keys {
+		public, err := ssh.ParsePublicKey(key.Blob)
+		if err != nil {
+			return nil, fmt.Errorf("parse listed public key: %w", err)
+		}
+		signers = append(signers, agentSigner{a: a, key: public})
+	}
+	return signers, nil
 }
 
 // getPINFor returns a function that prompts for the PIN for a specific YubiKey.
-func (a *Agent) getPINFor(yk *Yubi) func() (string, error) {
+func (a *Agent) getPINFor(ctx context.Context, yk *Yubi) func() (string, error) {
 	return func() (string, error) {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
 		if a.touchNotification != nil && a.touchNotification.Stop() {
-			defer a.touchNotification.Reset(TouchNotificationTimeout)
+			defer func() {
+				if ctx.Err() == nil {
+					a.touchNotification.Reset(TouchNotificationTimeout)
+				}
+			}()
 		}
 		r, err := yk.Device.Retries()
 		if err != nil {
 			log.Printf("Warning: failed to get retries: %v", err)
 			r = 0
 		}
-		return getPIN(yk.Serial, r)
+		pin, err := getPIN(ctx, yk.Serial, r)
+		if ctx.Err() != nil {
+			return "", ctx.Err()
+		}
+		return pin, err
 	}
 }
 
-func (a *Agent) signers() ([]ssh.Signer, error) {
-	var signers []ssh.Signer
-	for _, yk := range a.yks {
-		for _, slot := range enabledSlots {
-			pk, err := getPublicKey(yk.Device, slot)
-			if err != nil {
-				continue
-			}
-			priv, err := yk.Device.PrivateKey(
-				slot,
-				pk.(ssh.CryptoPublicKey).CryptoPublicKey(),
-				piv.KeyAuth{PINPrompt: a.getPINFor(yk)},
-			)
-			if err != nil {
-				continue
-			}
-			s, err := ssh.NewSignerFromKey(priv)
-			if err != nil {
-				return nil, fmt.Errorf("failed to prepare signer from slot %x: %w", slot, err)
-			}
-			signers = append(signers, s)
-		}
+func (a *Agent) prepareSigner(ctx context.Context, entry keyEntry) (ssh.Signer, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	return signers, nil
+	signer, err := a.source().Signer(entry.yubi, entry.slot, entry.publicKey, a.getPINFor(ctx, entry.yubi))
+	if err != nil {
+		return nil, fmt.Errorf("prepare signer from slot %x: %w", entry.slot.Key, err)
+	}
+	return signer, nil
 }
 
 // Sign implements the agent.Agent interface for signing data with a key.
@@ -415,19 +573,25 @@ func (a *Agent) Sign(key ssh.PublicKey, data []byte) (*ssh.Signature, error) {
 }
 
 // setupTouchNotification sets up a timer to show a notification if YubiKey touch is needed
-func (a *Agent) setupTouchNotification() (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
+func (a *Agent) setupTouchNotification(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
 	a.touchNotification = time.NewTimer(TouchNotificationTimeout)
+	timer := a.touchNotification
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
+		defer timer.Stop()
 		select {
-		case <-a.touchNotification.C:
+		case <-timer.C:
 		case <-ctx.Done():
-			a.touchNotification.Stop()
 			return
 		}
-		showNotification("Waiting for YubiKey touch...")
+		showNotification(ctx, "Waiting for YubiKey touch...")
 	}()
-	return ctx, cancel
+	return ctx, func() {
+		cancel()
+		<-done
+	}
 }
 
 // signatureAlgorithm determines the signature algorithm based on key type and flags
@@ -446,8 +610,12 @@ func signatureAlgorithm(key ssh.PublicKey, flags agent.SignatureFlags) string {
 // isRetriableAuthError checks if an error is a piv.AuthErr with remaining retries.
 // Returns the number of remaining retries if retriable, 0 otherwise.
 func isRetriableAuthError(err error) int {
+	var value piv.AuthErr
+	if errors.As(err, &value) && value.Retries > 0 {
+		return value.Retries
+	}
 	var authErr *piv.AuthErr
-	if errors.As(err, &authErr) && authErr.Retries > 0 {
+	if errors.As(err, &authErr) && authErr != nil && authErr.Retries > 0 {
 		return authErr.Retries
 	}
 	return 0
@@ -470,16 +638,13 @@ func (a *Agent) performSignature(signers []ssh.Signer, key ssh.PublicKey, data [
 	return nil, fmt.Errorf("no private keys match the requested public key")
 }
 
-func signWithRetryAndTimeout(
+// signWithRetry checks cancellation between blocking device calls. Its caller
+// owns the request deadline and must retain hardware ownership while it runs.
+func signWithRetry(
 	ctx context.Context,
 	getSigners func() ([]ssh.Signer, error),
 	perform func(signers []ssh.Signer) (*ssh.Signature, error),
 ) (*ssh.Signature, error) {
-	type result struct {
-		sig *ssh.Signature
-		err error
-	}
-
 	var lastRetries int
 	for {
 		if err := ctx.Err(); err != nil {
@@ -491,25 +656,12 @@ func signWithRetryAndTimeout(
 			return nil, err
 		}
 
-		resultCh := make(chan result, 1)
-		go func() {
-			sig, err := perform(signers)
-			select {
-			case resultCh <- result{sig: sig, err: err}:
-			case <-ctx.Done():
-			}
-		}()
-
-		var (
-			sig     *ssh.Signature
-			signErr error
-		)
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case res := <-resultCh:
-			sig = res.sig
-			signErr = res.err
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		sig, signErr := perform(signers)
+		if err := ctx.Err(); err != nil {
+			return nil, err
 		}
 
 		if signErr == nil {
@@ -526,32 +678,105 @@ func signWithRetryAndTimeout(
 	}
 }
 
-// SignWithFlags implements the agent.ExtendedAgent interface for signing with algorithm selection.
-// This operation has a 2-minute timeout to prevent indefinite blocking on YubiKey touch.
-func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if err := a.ensureYK(); err != nil {
-		return nil, fmt.Errorf("could not reach YubiKeys: %w", err)
-	}
+var errDeviceBusy = errors.New("device operation in progress")
 
+// runDeviceOperation bounds the caller's wait, including discovery and signer
+// preparation. Hardware PIN VERIFY and other PC/SC calls cannot be forcibly
+// cancelled, so the worker retains mu and the gate until the hardware returns
+// and all device use (including cleanup) has finished. A cached List may decline
+// to wait for the gate. At most one worker can outlive a caller's deadline.
+func (a *Agent) runDeviceOperation(ctx context.Context, work func() error, wait bool) error {
+	a.operationOnce.Do(func() { a.operationGate = make(chan struct{}, 1) })
+	if wait {
+		select {
+		case a.operationGate <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	} else {
+		select {
+		case a.operationGate <- struct{}{}:
+		default:
+			return errDeviceBusy
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		<-a.operationGate
+		return err
+	}
+	// The single buffered result lets a hardware worker finish after timeout.
+	results := make(chan error, 1)
+	go func() {
+		defer func() { <-a.operationGate }()
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if err := ctx.Err(); err != nil {
+			results <- err
+			return
+		}
+		err := work()
+		if ctx.Err() != nil {
+			// Refresh handles only after the in-flight card call has returned.
+			_ = a.closeYubiKeys()
+			err = ctx.Err()
+		}
+		results <- err
+	}()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-results:
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+}
+
+func (a *Agent) runSignOperation(ctx context.Context, work func() (*ssh.Signature, error)) (*ssh.Signature, error) {
+	var sig *ssh.Signature
+	err := a.runDeviceOperation(ctx, func() error {
+		var err error
+		sig, err = work()
+		return err
+	}, true)
+	if err != nil {
+		return nil, err
+	}
+	// Successful completion synchronizes the worker's write to sig.
+	return sig, nil
+}
+
+// SignWithFlags implements the agent.ExtendedAgent interface for signing with algorithm selection.
+// The caller has a two-minute deadline; device ownership survives a hardware timeout.
+func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.SignatureFlags) (*ssh.Signature, error) {
 	// Create context with timeout for the entire sign operation
 	ctx, cancel := context.WithTimeout(context.Background(), SignOperationTimeout)
 	defer cancel()
 
-	// Set up touch notification
-	_, cancelTouch := a.setupTouchNotification()
-	defer cancelTouch()
-
 	alg := signatureAlgorithm(key, flags)
-
-	sig, err := signWithRetryAndTimeout(
-		ctx,
-		a.signers,
-		func(signers []ssh.Signer) (*ssh.Signature, error) {
-			return a.performSignature(signers, key, data, alg)
-		},
-	)
+	sig, err := a.runSignOperation(ctx, func() (*ssh.Signature, error) {
+		if err := a.ensureYKContext(ctx); err != nil {
+			return nil, fmt.Errorf("could not reach YubiKeys: %w", err)
+		}
+		entry, err := a.resolveKey(key)
+		if err != nil {
+			return nil, err
+		}
+		_, cancelTouch := a.setupTouchNotification(ctx)
+		defer cancelTouch()
+		return signWithRetry(ctx,
+			func() ([]ssh.Signer, error) {
+				signer, err := a.prepareSigner(ctx, entry)
+				if err != nil {
+					return nil, err
+				}
+				return []ssh.Signer{signer}, nil
+			},
+			func(signers []ssh.Signer) (*ssh.Signature, error) {
+				return a.performSignature(signers, key, data, alg)
+			})
+	})
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return nil, fmt.Errorf("sign operation timed out after %v (touch required?): %w", SignOperationTimeout, err)
 	}
@@ -560,15 +785,15 @@ func (a *Agent) SignWithFlags(key ssh.PublicKey, data []byte, flags agent.Signat
 
 // showNotification displays a system notification on macOS and Linux.
 // Notification failures are intentionally ignored as they are non-critical.
-func showNotification(message string) {
+func showNotification(ctx context.Context, message string) {
 	switch runtime.GOOS {
 	case "darwin":
 		message = strings.ReplaceAll(message, `\`, `\\`)
 		message = strings.ReplaceAll(message, `"`, `\"`)
 		appleScript := `display notification "%s" with title "yubikey-agent"`
-		_ = exec.Command("osascript", "-e", fmt.Sprintf(appleScript, message)).Run()
+		_ = exec.CommandContext(ctx, "osascript", "-e", fmt.Sprintf(appleScript, message)).Run()
 	case "linux":
-		_ = exec.Command("notify-send", "-i", "dialog-password", "yubikey-agent", message).Run()
+		_ = exec.CommandContext(ctx, "notify-send", "-i", "dialog-password", "yubikey-agent", message).Run()
 	}
 }
 

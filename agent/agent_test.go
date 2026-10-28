@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/go-piv/piv-go/v2/piv"
@@ -220,12 +221,12 @@ func TestAgentExtension(t *testing.T) {
 	}
 }
 
-func TestSignWithRetryAndTimeoutContextDeadline(t *testing.T) {
+func TestSignWithRetryContextDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 	defer cancel()
 	retries := 100
 
-	_, err := signWithRetryAndTimeout(
+	_, err := signWithRetry(
 		ctx,
 		func() ([]ssh.Signer, error) { return nil, nil },
 		func(signers []ssh.Signer) (*ssh.Signature, error) {
@@ -236,14 +237,14 @@ func TestSignWithRetryAndTimeoutContextDeadline(t *testing.T) {
 	)
 
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("signWithRetryAndTimeout() error = %v, want context deadline exceeded", err)
+		t.Fatalf("signWithRetry() error = %v, want context deadline exceeded", err)
 	}
 }
 
-func TestSignWithRetryAndTimeoutRetryStopsWithoutProgress(t *testing.T) {
+func TestSignWithRetryRetryStopsWithoutProgress(t *testing.T) {
 	attempts := 0
 
-	_, err := signWithRetryAndTimeout(
+	_, err := signWithRetry(
 		context.Background(),
 		func() ([]ssh.Signer, error) { return nil, nil },
 		func(signers []ssh.Signer) (*ssh.Signature, error) {
@@ -256,32 +257,28 @@ func TestSignWithRetryAndTimeoutRetryStopsWithoutProgress(t *testing.T) {
 		t.Fatalf("attempt count = %d, want 2", attempts)
 	}
 	if err == nil {
-		t.Fatal("signWithRetryAndTimeout() expected error, got nil")
+		t.Fatal("signWithRetry() expected error, got nil")
 	}
 }
 
-func TestSignWithRetryAndTimeoutReturnsOnContextWhilePerformBlocks(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
-	defer cancel()
-
-	errCh := make(chan error, 1)
-	go func() {
-		_, err := signWithRetryAndTimeout(
-			ctx,
-			func() ([]ssh.Signer, error) { return nil, nil },
-			func(signers []ssh.Signer) (*ssh.Signature, error) {
-				select {}
-			},
-		)
-		errCh <- err
-	}()
-
-	select {
-	case err := <-errCh:
+func TestSignWithRetryReturnsOnContextWhilePerformBlocks(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		release := make(chan struct{})
+		a := &Agent{}
+		_, err := a.runSignOperation(ctx, func() (*ssh.Signature, error) {
+			return signWithRetry(ctx,
+				func() ([]ssh.Signer, error) { return nil, nil },
+				func([]ssh.Signer) (*ssh.Signature, error) {
+					<-release
+					return nil, nil
+				})
+		})
 		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("signWithRetryAndTimeout() error = %v, want context deadline exceeded", err)
+			t.Errorf("error = %v, want deadline exceeded", err)
 		}
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("signWithRetryAndTimeout() did not return after context deadline")
-	}
+		close(release)
+		synctest.Wait() // The blocked worker must also finish before the test ends.
+	})
 }

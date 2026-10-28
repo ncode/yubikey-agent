@@ -25,6 +25,11 @@ var listCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
+		defer func() {
+			for _, yubi := range yubikeys {
+				_ = yubi.Device.Close() // Release every device after listing.
+			}
+		}()
 		for _, yubi := range yubikeys {
 			if viper.GetBool("plain") {
 				fmt.Printf("%s #%d\n", yubi.Name, yubi.Serial)
